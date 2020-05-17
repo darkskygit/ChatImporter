@@ -1,6 +1,6 @@
 mod matcher;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use gchdb::{ChatRecoder, Record, SqliteChatRecorder};
 use log::warn;
 use matcher::{MsgMatcher, QQMsgMatcher};
@@ -19,5 +19,7 @@ fn main() -> Result<()> {
 }
 
 fn transfrom_chat_to_records<P: AsRef<Path>>(path: P) -> Result<Vec<Record>> {
-    Ok(QQMsgMatcher::new(read_to_string(path)?).get_records())
+    QQMsgMatcher::new(read_to_string(path)?, "test".into())
+        .get_records()
+        .context("Cannot transfrom records")
 }
