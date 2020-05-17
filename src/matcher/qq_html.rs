@@ -1,6 +1,7 @@
 use super::*;
 use chrono::{NaiveDate, NaiveTime};
 use scraper::{ElementRef, Html, Node, Selector};
+use std::cmp::max;
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -193,18 +194,34 @@ impl MsgMatcher for QQMsgMatcher {
                     .iter()
                     .skip(4)
                     .map(Self::transfrom_msg_line)
-                    .fold((None, vec![]), |(date, mut ret), curr| match curr {
-                        Some(QQMsgLine::Date(date)) => (
-                            Some(NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap()),
-                            ret,
-                        ),
-                        Some(line @ QQMsgLine::Message { .. }) => {
-                            self.transfrom_record(group_id.clone(), date.clone(), line)
-                                .map(|record| ret.push(record));
-                            (date, ret)
-                        }
-                        None => (date, ret),
-                    })
+                    .fold(
+                        (None, Vec::<Record>::new()),
+                        |(date, mut ret), curr| match curr {
+                            Some(QQMsgLine::Date(date)) => (
+                                Some(NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap()),
+                                ret,
+                            ),
+                            Some(line @ QQMsgLine::Message { .. }) => {
+                                self.transfrom_record(group_id.clone(), date.clone(), line)
+                                    .map(|mut record| {
+                                        if let Some(some_sec) = ret
+                                            .iter()
+                                            .filter(|r| {
+                                                i64::abs(r.timestamp - record.timestamp) < 1000
+                                                    && r.sender == record.sender
+                                            })
+                                            .map(|r| r.timestamp)
+                                            .max()
+                                        {
+                                            record.timestamp = max(some_sec, record.timestamp) + 1;
+                                        }
+                                        ret.push(record)
+                                    });
+                                (date, ret)
+                            }
+                            None => (date, ret),
+                        },
+                    )
                     .1
             })
         })
