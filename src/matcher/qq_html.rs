@@ -1,13 +1,14 @@
 use super::*;
 use chrono::{NaiveDate, NaiveTime};
 use scraper::{ElementRef, Html, Node, Selector};
+use serde_json::to_vec;
 use std::cmp::max;
 use std::path::PathBuf;
 
 #[derive(Clone)]
-enum QQMsgType {
-    Content(String),
-    Image(PathBuf),
+struct QQMsg {
+    content: String,
+    images: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -17,7 +18,7 @@ enum QQMsgLine {
         sender: String,
         sender_id: String,
         time: NaiveTime,
-        msg: QQMsgType,
+        msg: QQMsg,
     },
 }
 
@@ -123,10 +124,38 @@ impl QQMsgMatcher {
             })
     }
 
-    fn process_msg(content: ElementRef) -> Option<QQMsgType> {
-        Some(QQMsgType::Content(
-            decode_html(&content.inner_html()).unwrap_or(content.inner_html()),
-        ))
+    fn process_msg(content: ElementRef) -> Option<QQMsg> {
+        lazy_static! {
+            static ref FONT_REPLACER: Regex = Regex::new("<font .*?>(?P<text>.*?)</font>").unwrap();
+            static ref B_REPLACER: Regex = Regex::new("<b>(?P<text>.*?)</b>").unwrap();
+            static ref I_REPLACER: Regex = Regex::new("<i>(?P<text>.*?)</i>").unwrap();
+            static ref U_REPLACER: Regex = Regex::new("<u>(?P<text>.*?)</u>").unwrap();
+            static ref IMG_REPLACER: Regex = Regex::new(r#"<img src="(?P<img>.*?)">"#).unwrap();
+        }
+        let decoded = decode_html(&content.inner_html()).unwrap_or(content.inner_html());
+        Some(QQMsg {
+            content: [
+                (&*FONT_REPLACER, "$text"),
+                (&*B_REPLACER, "$text"),
+                (&*I_REPLACER, "$text"),
+                (&*U_REPLACER, "$text"),
+                (&*IMG_REPLACER, "<img>"),
+            ]
+            .iter()
+            .fold(decoded.clone(), |content, (matcher, rep)| {
+                matcher.replace_all(&content, *rep).into()
+            }),
+            images: IMG_REPLACER
+                .captures_iter(&decoded)
+                .map(|c| {
+                    PathBuf::from(c["img"].trim())
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(c["img"].trim())
+                        .into()
+                })
+                .collect(),
+        })
     }
 
     fn transfrom_msg_line(elm: &ElementRef) -> Option<QQMsgLine> {
@@ -163,22 +192,30 @@ impl QQMsgMatcher {
                 msg,
             } = line
             {
-                Some(Record {
-                    chat_type: "QQ".into(),
-                    owner_id: self.owner.clone(),
-                    group_id,
-                    sender: sender_id,
-                    content: match msg {
-                        QQMsgType::Content(content) => content,
-                        QQMsgType::Image(p) => p
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default()
-                            .into(),
-                    },
-                    timestamp: date.and_time(time).timestamp_millis(),
-                    ..Default::default()
-                })
+                if msg.images.len() > 0 {
+                    to_vec(&msg.images).ok().and_then(|metadata| {
+                        Some(Record {
+                            chat_type: "QQ".into(),
+                            owner_id: self.owner.clone(),
+                            group_id,
+                            sender: sender_id,
+                            content: msg.content,
+                            timestamp: date.and_time(time).timestamp_millis(),
+                            metadata: Some(metadata),
+                            ..Default::default()
+                        })
+                    })
+                } else {
+                    Some(Record {
+                        chat_type: "QQ".into(),
+                        owner_id: self.owner.clone(),
+                        group_id,
+                        sender: sender_id,
+                        content: msg.content,
+                        timestamp: date.and_time(time).timestamp_millis(),
+                        ..Default::default()
+                    })
+                }
             } else {
                 None
             }

@@ -178,6 +178,7 @@ dependencies = [
  "log",
  "regex",
  "scraper",
+ "serde_json",
 ]
 
 [[package]]
