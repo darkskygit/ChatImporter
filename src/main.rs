@@ -2,7 +2,7 @@ mod matcher;
 
 use anyhow::{Context, Result};
 use gchdb::{ChatRecoder, Record, SqliteChatRecorder};
-use log::warn;
+use log::{error, warn};
 use matcher::{MsgMatcher, QQMsgMatcher};
 use std::fs::read_to_string;
 use std::path::Path;

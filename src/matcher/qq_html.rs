@@ -1,6 +1,6 @@
 use super::*;
-use chrono::{NaiveDate, NaiveTime, TimeZone};
-use scraper::{element_ref::Select, ElementRef, Html, Node, Selector};
+use chrono::{NaiveDate, NaiveTime};
+use scraper::{ElementRef, Html, Node, Selector};
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -34,36 +34,118 @@ impl QQMsgMatcher {
     }
 
     fn get_table(&self) -> Option<Vec<ElementRef>> {
-        Selector::parse("body>table>tbody").ok().and_then(|table| {
-            Selector::parse("tr>td").ok().and_then(|selector| {
-                self.html
-                    .select(&table)
-                    .next()
-                    .map(|elm| elm.select(&selector).collect())
-            })
-        })
+        lazy_static! {
+            static ref TABLE_SELECTOR: Selector = Selector::parse("body>table>tbody").unwrap();
+            static ref TR_TD_SELECTOR: Selector = Selector::parse("tr>td").unwrap();
+        }
+        self.html
+            .select(&*TABLE_SELECTOR)
+            .next()
+            .map(|elm| elm.select(&*TR_TD_SELECTOR).collect())
+    }
+
+    fn first_match<'t>(captures: Option<Captures<'t>>) -> Option<String> {
+        captures
+            .and_then(|c| c.iter().skip(1).next().and_then(|i| i))
+            .map(|i| i.as_str().trim().into())
     }
 
     fn get_group_id(node: Vec<&ElementRef>) -> Option<String> {
-        Regex::new("^消息对象:(.*?)$")
-            .ok()
-            .and_then(|regex| {
-                Selector::parse("tr>td>div")
-                    .map(|selector| (regex, selector))
-                    .ok()
-            })
-            .and_then(|(regex, selector)| {
-                node[2].select(&selector).next().and_then(|elm| {
-                    regex
-                        .captures(&elm.inner_html())
-                        .and_then(|c| c.iter().skip(1).next().and_then(|i| i))
-                        .map(|i| i.as_str().trim().into())
+        lazy_static! {
+            static ref DIV_SELECTOR: Selector = Selector::parse("tr>td>div").unwrap();
+            static ref GROUP_MATCHER: Regex = Regex::new("^消息对象:(.*?)$").unwrap();
+        }
+        node[2]
+            .select(&*DIV_SELECTOR)
+            .next()
+            .and_then(|elm| Self::first_match(GROUP_MATCHER.captures(&elm.inner_html())))
+    }
+
+    fn parse_sender(elm: ElementRef) -> Option<(String, String)> {
+        lazy_static! {
+            static ref NAME_MATCHER: Regex = Regex::new(r"^(.*?)[<\(](.*?)[>\)]$").unwrap();
+        }
+        match decode_html(&elm.inner_html()) {
+            Ok(decoded) => NAME_MATCHER
+                .captures(&decoded.replace("&get;", ">"))
+                .and_then(|c| {
+                    match c
+                        .iter()
+                        .skip(1)
+                        .take(2)
+                        .filter_map(|i| i.clone())
+                        .map(|i| i.as_str().trim().to_string())
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                    {
+                        [sender, sender_id] => Some((sender.clone(), sender_id.clone())),
+                        _ => None,
+                    }
                 })
+                .or_else(|| {
+                    error!("Failed to parse name line: {}", decoded);
+                    None
+                }),
+            Err(e) => {
+                warn!("Failed to decode Html: {:?}", e);
+                None
+            }
+        }
+    }
+
+    fn parse_time(name: &ElementRef) -> Option<NaiveTime> {
+        name.children()
+            .skip(1)
+            .next()
+            .and_then(|nodereef| match nodereef.value() {
+                Node::Text(text) => Some(text),
+                _ => None,
+            })
+            .and_then(|time| match NaiveTime::parse_from_str(time, "%H:%M:%S") {
+                Ok(time) => Some(time),
+                Err(e) => {
+                    warn!("Failed to parse time: {}", e);
+                    None
+                }
             })
     }
 
+    fn process_name(name: ElementRef) -> Option<(String, String, NaiveTime)> {
+        lazy_static! {
+            static ref INNER_DIV_SELECTOR: Selector = Selector::parse("tr>td>div>div").unwrap();
+        }
+        name.select(&*INNER_DIV_SELECTOR)
+            .next()
+            .and_then(Self::parse_sender)
+            .and_then(|(sender, sender_id)| {
+                Self::parse_time(&name).map(|time| (sender, sender_id, time))
+            })
+    }
+
+    fn process_msg(content: ElementRef) -> Option<QQMsgType> {
+        Some(QQMsgType::Content(
+            decode_html(&content.inner_html()).unwrap_or(content.inner_html()),
+        ))
+    }
+
     fn transfrom_msg_line(elm: &ElementRef) -> Option<QQMsgLine> {
-        None
+        lazy_static! {
+            static ref DATE_MATCHER: Regex = Regex::new("^日期: (.*?)$").unwrap();
+            static ref DIV_SELECTOR: Selector = Selector::parse("tr>td>div").unwrap();
+        }
+        let divs = elm.select(&*DIV_SELECTOR).take(2).collect::<Vec<_>>();
+        if let &[name, content] = divs.as_slice() {
+            Self::process_name(name).and_then(|(sender, sender_id, time)| {
+                Self::process_msg(content).map(|msg| QQMsgLine::Message {
+                    sender,
+                    sender_id,
+                    time,
+                    msg,
+                })
+            })
+        } else {
+            Self::first_match(DATE_MATCHER.captures(&elm.inner_html())).map(QQMsgLine::Date)
+        }
     }
 
     fn transfrom_record(
@@ -113,7 +195,7 @@ impl MsgMatcher for QQMsgMatcher {
                     .map(Self::transfrom_msg_line)
                     .fold((None, vec![]), |(date, mut ret), curr| match curr {
                         Some(QQMsgLine::Date(date)) => (
-                            Some(NaiveDate::parse_from_str(&date, "2015-09-05").unwrap()),
+                            Some(NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap()),
                             ret,
                         ),
                         Some(line @ QQMsgLine::Message { .. }) => {

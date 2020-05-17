@@ -1,7 +1,9 @@
 mod qq_html;
 
 use super::*;
-use regex::Regex;
+use htmlescape::decode_html;
+use lazy_static::lazy_static;
+use regex::{Captures, Regex};
 
 pub use qq_html::QQMsgMatcher;
 
