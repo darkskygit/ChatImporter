@@ -27,7 +27,13 @@ pub fn qq_mht_importer<P: AsRef<Path>>(
     path: P,
     owner: String,
 ) -> Result<()> {
-    let matcher = QQMhtMsgMatcher::new(&read(path)?, owner)?;
+    let filename = path
+        .as_ref()
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .into();
+    let matcher = QQMhtMsgMatcher::new(&read(path)?, owner, filename)?;
     let records = matcher.get_records().context("Cannot transfrom records")?;
     let mut progress = 0.0;
     let mut sw = Instant::now();

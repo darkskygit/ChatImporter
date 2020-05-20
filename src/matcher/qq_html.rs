@@ -50,17 +50,19 @@ impl QQAttachGetter for QQPathAttachGetter {}
 pub struct QQMsgMatcher {
     html: Html,
     owner: String,
+    file_name: String,
     attach_getter: Box<dyn QQAttachGetter>,
 }
 
 impl QQMsgMatcher {
-    pub fn new<A>(html: String, owner: String, attach_getter: A) -> Self
+    pub fn new<A>(html: String, owner: String, file_name: String, attach_getter: A) -> Self
     where
         A: 'static + QQAttachGetter,
     {
         Self {
             html: Html::parse_document(&html),
             owner,
+            file_name,
             attach_getter: Box::new(attach_getter),
         }
     }
@@ -82,15 +84,29 @@ impl QQMsgMatcher {
             .map(|i| i.as_str().trim().into())
     }
 
-    fn get_group_id(node: Vec<&ElementRef>) -> Option<String> {
+    fn get_group_id(node: Vec<&ElementRef>) -> Option<(bool, String)> {
         lazy_static! {
             static ref DIV_SELECTOR: Selector = Selector::parse("tr>td>div").unwrap();
+            static ref TYPE_MATCHER: Regex = Regex::new("^消息分组:(.*?)$").unwrap();
             static ref GROUP_MATCHER: Regex = Regex::new("^消息对象:(.*?)$").unwrap();
         }
         node[2]
             .select(&*DIV_SELECTOR)
             .next()
             .and_then(|elm| Self::first_match(GROUP_MATCHER.captures(&elm.inner_html())))
+            .and_then(|group_id| decode_html(&group_id).ok())
+            .and_then(|group_id| {
+                node[1]
+                    .select(&*DIV_SELECTOR)
+                    .next()
+                    .and_then(|elm| Self::first_match(TYPE_MATCHER.captures(&elm.inner_html())))
+                    .map(|group_type| {
+                        (
+                            group_type.contains("联系人") || group_type.contains("临时会话"),
+                            group_id,
+                        )
+                    })
+            })
     }
 
     fn parse_sender(elm: ElementRef) -> Option<(String, String)> {
@@ -125,6 +141,44 @@ impl QQMsgMatcher {
         }
     }
 
+    fn parse_sender_pm(&self, elm: ElementRef, is_self: bool) -> Option<(String, String)> {
+        lazy_static! {
+            static ref NAME_MATCHER: Regex = Regex::new(r"^(.*?)[<\(](.*?)[>\)]$").unwrap();
+        }
+        match decode_html(&elm.inner_html()) {
+            Ok(decoded) => {
+                if is_self {
+                    Some((decoded, self.owner.clone()))
+                } else {
+                    NAME_MATCHER
+                        .captures(&self.file_name)
+                        .and_then(|c| {
+                            match c
+                                .iter()
+                                .skip(1)
+                                .take(2)
+                                .filter_map(|i| i.clone())
+                                .map(|i| i.as_str().trim().to_string())
+                                .collect::<Vec<_>>()
+                                .as_slice()
+                            {
+                                [_, sender_id] => Some((decoded.clone(), sender_id.clone())),
+                                _ => None,
+                            }
+                        })
+                        .or_else(|| {
+                            error!("Failed to parse name line: {}", decoded);
+                            None
+                        })
+                }
+            }
+            Err(e) => {
+                warn!("Failed to decode Html: {:?}", e);
+                None
+            }
+        }
+    }
+
     fn parse_time(name: &ElementRef) -> Option<NaiveTime> {
         name.children()
             .skip(1)
@@ -142,16 +196,33 @@ impl QQMsgMatcher {
             })
     }
 
-    fn process_name(name: ElementRef) -> Option<(String, String, NaiveTime)> {
+    fn process_name(&self, name: ElementRef, is_pm: bool) -> Option<(String, String, NaiveTime)> {
         lazy_static! {
             static ref INNER_DIV_SELECTOR: Selector = Selector::parse("tr>td>div>div").unwrap();
+            static ref DIV_SELECTOR: Selector = Selector::parse("tr>td").unwrap();
+            static ref DIV_STYLE: Regex = Regex::new("(#.*?);").unwrap();
         }
-        name.select(&*INNER_DIV_SELECTOR)
-            .next()
-            .and_then(Self::parse_sender)
-            .and_then(|(sender, sender_id)| {
-                Self::parse_time(&name).map(|time| (sender, sender_id, time))
-            })
+        if is_pm {
+            let is_self = name
+                .parent()
+                .and_then(ElementRef::wrap)
+                .and_then(|elm| Self::first_match(DIV_STYLE.captures(&elm.inner_html())))
+                .map(|color| color == "#42B475")
+                .unwrap_or(false);
+            name.select(&*INNER_DIV_SELECTOR)
+                .next()
+                .and_then(|elm| self.parse_sender_pm(elm, is_self))
+                .and_then(|(sender, sender_id)| {
+                    Self::parse_time(&name).map(|time| (sender, sender_id, time))
+                })
+        } else {
+            name.select(&*INNER_DIV_SELECTOR)
+                .next()
+                .and_then(Self::parse_sender)
+                .and_then(|(sender, sender_id)| {
+                    Self::parse_time(&name).map(|time| (sender, sender_id, time))
+                })
+        }
     }
 
     fn convert_image(&self, path: &str) -> QQMsgImage {
@@ -186,21 +257,22 @@ impl QQMsgMatcher {
         })
     }
 
-    fn transfrom_msg_line(&self, elm: &ElementRef) -> Option<QQMsgLine> {
+    fn transfrom_msg_line(&self, elm: &ElementRef, is_pm: bool) -> Option<QQMsgLine> {
         lazy_static! {
             static ref DATE_MATCHER: Regex = Regex::new("^日期: (.*?)$").unwrap();
             static ref DIV_SELECTOR: Selector = Selector::parse("tr>td>div").unwrap();
         }
         let divs = elm.select(&*DIV_SELECTOR).take(2).collect::<Vec<_>>();
         if let &[name, content] = divs.as_slice() {
-            Self::process_name(name).and_then(|(sender_name, sender_id, time)| {
-                self.process_msg(content).map(|msg| QQMsgLine::Message {
-                    sender_id,
-                    sender_name,
-                    time,
-                    msg,
+            self.process_name(name, is_pm)
+                .and_then(|(sender_name, sender_id, time)| {
+                    self.process_msg(content).map(|msg| QQMsgLine::Message {
+                        sender_id,
+                        sender_name,
+                        time,
+                        msg,
+                    })
                 })
-            })
         } else {
             Self::first_match(DATE_MATCHER.captures(&elm.inner_html())).map(QQMsgLine::Date)
         }
@@ -309,11 +381,11 @@ impl QQMsgMatcher {
 impl MsgMatcher for QQMsgMatcher {
     fn get_records(&self) -> Option<Vec<RecordType>> {
         self.get_table().and_then(|table| {
-            Self::get_group_id(table.iter().take(4).collect::<Vec<_>>()).map(|group_id| {
+            Self::get_group_id(table.iter().take(4).collect::<Vec<_>>()).map(|(is_pm, group_id)| {
                 table
                     .iter()
                     .skip(4)
-                    .map(|elm| self.transfrom_msg_line(elm))
+                    .map(|elm| self.transfrom_msg_line(elm, is_pm))
                     .fold(
                         (None, Vec::<RecordType>::new()),
                         |(date, mut ret), curr| match curr {

@@ -8,7 +8,7 @@ pub struct QQMhtMsgMatcher {
 }
 
 impl QQMhtMsgMatcher {
-    pub fn new(data: &[u8], owner: String) -> Result<Self, MailParseError> {
+    pub fn new(data: &[u8], owner: String, file_name: String) -> Result<Self, MailParseError> {
         info!("Parsing mht...");
         let mht = parse_mail(data)?;
         let attachs = mht
@@ -29,7 +29,14 @@ impl QQMhtMsgMatcher {
         attachs
             .get("__main__")
             .and_then(|data| String::from_utf8(data.clone()).ok())
-            .map(|html| QQMsgMatcher::new(html, owner, QQMhtAttachGetter::new(attachs.clone())))
+            .map(|html| {
+                QQMsgMatcher::new(
+                    html,
+                    owner,
+                    file_name,
+                    QQMhtAttachGetter::new(attachs.clone()),
+                )
+            })
             .map(|qq_html_matcher| Self { qq_html_matcher })
             .ok_or(MailParseError::Generic("test"))
     }
