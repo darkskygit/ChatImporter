@@ -22,8 +22,12 @@ use std::fs::read;
 use std::path::Path;
 use std::time::Instant;
 
-pub fn qq_mht_importer<P: AsRef<Path>>(recorder: &mut SqliteChatRecorder, path: P) -> Result<()> {
-    let matcher = QQMhtMsgMatcher::new(&read(path)?, "test".into())?;
+pub fn qq_mht_importer<P: AsRef<Path>>(
+    recorder: &mut SqliteChatRecorder,
+    path: P,
+    owner: String,
+) -> Result<()> {
+    let matcher = QQMhtMsgMatcher::new(&read(path)?, owner)?;
     let records = matcher.get_records().context("Cannot transfrom records")?;
     let mut progress = 0.0;
     let mut sw = Instant::now();
@@ -34,7 +38,7 @@ pub fn qq_mht_importer<P: AsRef<Path>>(recorder: &mut SqliteChatRecorder, path: 
             .unwrap_or_default();
         if (i + 1) as f64 / records.len() as f64 - progress > 0.01 {
             progress = (i + 1) as f64 / records.len() as f64;
-            println!(
+            info!(
                 "current progress: {}%, {}/{}, {}ms",
                 progress * 100.0,
                 i,
