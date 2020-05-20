@@ -15,3 +15,38 @@ pub use qq_mht::QQMhtMsgMatcher;
 pub trait MsgMatcher {
     fn get_records(&self) -> Option<Vec<RecordType>>;
 }
+
+use anyhow::{Context, Result};
+use gchdb::{ChatRecoder, SqliteChatRecorder};
+use std::fs::read;
+use std::path::Path;
+use std::time::Instant;
+
+pub fn qq_mht_importer<P: AsRef<Path>>(recorder: &mut SqliteChatRecorder, path: P) -> Result<()> {
+    let matcher = QQMhtMsgMatcher::new(&read(path)?, "test".into())?;
+    let records = matcher.get_records().context("Cannot transfrom records")?;
+    let mut progress = 0.0;
+    let mut sw = Instant::now();
+    for (i, record) in records.iter().enumerate() {
+        let content = record
+            .get_record()
+            .map(|r| r.content.clone())
+            .unwrap_or_default();
+        if (i + 1) as f64 / records.len() as f64 - progress > 0.01 {
+            progress = (i + 1) as f64 / records.len() as f64;
+            println!(
+                "current progress: {}%, {}/{}, {}ms",
+                progress * 100.0,
+                i,
+                records.len(),
+                sw.elapsed().as_millis()
+            );
+            sw = Instant::now();
+        }
+        if !recorder.insert_or_update_record(record.clone())? {
+            warn!("Failed to insert record: {}", content);
+        }
+    }
+    recorder.refresh_index()?;
+    Ok(())
+}
