@@ -23,8 +23,8 @@ struct QQMsg {
 enum QQMsgLine {
     Date(String),
     Message {
-        sender: String,
         sender_id: String,
+        sender_name: String,
         time: NaiveTime,
         msg: QQMsg,
     },
@@ -193,10 +193,10 @@ impl QQMsgMatcher {
         }
         let divs = elm.select(&*DIV_SELECTOR).take(2).collect::<Vec<_>>();
         if let &[name, content] = divs.as_slice() {
-            Self::process_name(name).and_then(|(sender, sender_id, time)| {
+            Self::process_name(name).and_then(|(sender_name, sender_id, time)| {
                 self.process_msg(content).map(|msg| QQMsgLine::Message {
-                    sender,
                     sender_id,
+                    sender_name,
                     time,
                     msg,
                 })
@@ -214,8 +214,8 @@ impl QQMsgMatcher {
     ) -> Option<RecordType> {
         date.and_then(|date| {
             if let QQMsgLine::Message {
-                sender,
                 sender_id,
+                sender_name,
                 time,
                 msg,
             } = line
@@ -239,7 +239,8 @@ impl QQMsgMatcher {
                                 chat_type: "QQ".into(),
                                 owner_id: self.owner.clone(),
                                 group_id,
-                                sender: sender_id,
+                                sender_id,
+                                sender_name,
                                 content: msg.content,
                                 timestamp: date.and_time(time).timestamp_millis(),
                                 metadata: Some(metadata),
@@ -259,7 +260,8 @@ impl QQMsgMatcher {
                         chat_type: "QQ".into(),
                         owner_id: self.owner.clone(),
                         group_id,
-                        sender: sender_id,
+                        sender_id,
+                        sender_name,
                         content: msg.content,
                         timestamp: date.and_time(time).timestamp_millis(),
                         ..Default::default()
@@ -332,7 +334,7 @@ impl MsgMatcher for QQMsgMatcher {
                                                         .filter(|r| {
                                                             i64::abs(r.timestamp - record.timestamp)
                                                                 < 1000
-                                                                && r.sender == record.sender
+                                                                && r.sender_id == record.sender_id
                                                         })
                                                         .map(|r| r.timestamp)
                                                         .max(),
