@@ -9,6 +9,7 @@ pub struct QQMhtMsgMatcher {
 
 impl QQMhtMsgMatcher {
     pub fn new(data: &[u8], owner: String) -> Result<Self, MailParseError> {
+        info!("Parsing mht...");
         let mht = parse_mail(data)?;
         let attachs = mht
             .subparts
