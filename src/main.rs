@@ -1,9 +1,9 @@
 mod matcher;
 
 use anyhow::{Context, Result};
-use gchdb::{ChatRecoder, Record, SqliteChatRecorder};
+use gchdb::{Attachment, ChatRecoder, Record, SqliteChatRecorder};
 use log::{error, warn};
-use matcher::{MsgMatcher, QQMsgMatcher};
+use matcher::{MsgMatcher, QQMsgMatcher, QQPathAttachGetter};
 use std::fs::read_to_string;
 use std::path::Path;
 
@@ -19,7 +19,7 @@ fn main() -> Result<()> {
 }
 
 fn transfrom_chat_to_records<P: AsRef<Path>>(path: P) -> Result<Vec<Record>> {
-    QQMsgMatcher::new(read_to_string(path)?, "test".into())
+    QQMsgMatcher::new(read_to_string(path)?, "test".into(), QQPathAttachGetter)
         .get_records()
         .context("Cannot transfrom records")
 }

@@ -1,14 +1,21 @@
 use super::*;
 use chrono::{NaiveDate, NaiveTime};
 use scraper::{ElementRef, Html, Node, Selector};
+use serde::Serialize;
 use serde_json::to_vec;
 use std::cmp::max;
 use std::path::PathBuf;
 
+#[derive(Clone, Serialize)]
+enum QQMsgImage {
+    Attach(Attachment),
+    UnmatchName(String),
+}
+
 #[derive(Clone)]
 struct QQMsg {
     content: String,
-    images: Vec<String>,
+    images: Vec<QQMsgImage>,
 }
 
 #[derive(Clone)]
@@ -22,16 +29,37 @@ enum QQMsgLine {
     },
 }
 
+pub trait QQAttachGetter {
+    fn get_attach(&self, path: &str) -> QQMsgImage {
+        QQMsgImage::UnmatchName(
+            PathBuf::from(path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path)
+                .into(),
+        )
+    }
+}
+
+pub struct QQPathAttachGetter;
+
+impl QQAttachGetter for QQPathAttachGetter {}
+
 pub struct QQMsgMatcher {
     html: Html,
     owner: String,
+    attach_getter: Box<dyn QQAttachGetter>,
 }
 
 impl QQMsgMatcher {
-    pub fn new(html: String, owner: String) -> Self {
+    pub fn new<A>(html: String, owner: String, attach_getter: A) -> Self
+    where
+        A: 'static + QQAttachGetter,
+    {
         Self {
             html: Html::parse_document(&html),
             owner,
+            attach_getter: Box::new(attach_getter),
         }
     }
 
@@ -124,7 +152,11 @@ impl QQMsgMatcher {
             })
     }
 
-    fn process_msg(content: ElementRef) -> Option<QQMsg> {
+    fn convert_image(&self, path: &str) -> QQMsgImage {
+        self.attach_getter.get_attach(path)
+    }
+
+    fn process_msg(&self, content: ElementRef) -> Option<QQMsg> {
         lazy_static! {
             static ref FONT_REPLACER: Regex = Regex::new("<font .*?>(?P<text>.*?)</font>").unwrap();
             static ref B_REPLACER: Regex = Regex::new("<b>(?P<text>.*?)</b>").unwrap();
@@ -147,18 +179,12 @@ impl QQMsgMatcher {
             }),
             images: IMG_REPLACER
                 .captures_iter(&decoded)
-                .map(|c| {
-                    PathBuf::from(c["img"].trim())
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(c["img"].trim())
-                        .into()
-                })
+                .map(|c| self.convert_image(c["img"].trim()))
                 .collect(),
         })
     }
 
-    fn transfrom_msg_line(elm: &ElementRef) -> Option<QQMsgLine> {
+    fn transfrom_msg_line(&self, elm: &ElementRef) -> Option<QQMsgLine> {
         lazy_static! {
             static ref DATE_MATCHER: Regex = Regex::new("^日期: (.*?)$").unwrap();
             static ref DIV_SELECTOR: Selector = Selector::parse("tr>td>div").unwrap();
@@ -166,7 +192,7 @@ impl QQMsgMatcher {
         let divs = elm.select(&*DIV_SELECTOR).take(2).collect::<Vec<_>>();
         if let &[name, content] = divs.as_slice() {
             Self::process_name(name).and_then(|(sender, sender_id, time)| {
-                Self::process_msg(content).map(|msg| QQMsgLine::Message {
+                self.process_msg(content).map(|msg| QQMsgLine::Message {
                     sender,
                     sender_id,
                     time,
@@ -230,7 +256,7 @@ impl MsgMatcher for QQMsgMatcher {
                 table
                     .iter()
                     .skip(4)
-                    .map(Self::transfrom_msg_line)
+                    .map(|elm| self.transfrom_msg_line(elm))
                     .fold(
                         (None, Vec::<Record>::new()),
                         |(date, mut ret), curr| match curr {
