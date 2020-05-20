@@ -250,8 +250,36 @@ impl QQMsgMatcher {
         })
     }
 
-    fn modify_timestamp(record_type: RecordType, near_sec: Option<i64>) -> RecordType {
-        record_type
+    fn modify_timestamp(record_type: RecordType, near_sec: Option<i64>) -> Option<RecordType> {
+        if let Some(near_sec) = near_sec {
+            match record_type {
+                RecordType::Record(record) => Some(RecordType::from(Record {
+                    timestamp: max(near_sec, record.timestamp) + 1,
+                    ..record
+                })),
+                RecordType::RecordRef(record) => Some(RecordType::from(Record {
+                    timestamp: max(near_sec, record.timestamp) + 1,
+                    ..record.clone()
+                })),
+                RecordType::RecordWithAttachs { record, attachs } => Some(RecordType::from((
+                    Record {
+                        timestamp: max(near_sec, record.timestamp) + 1,
+                        ..record
+                    },
+                    attachs,
+                ))),
+                RecordType::RecordRefWithAttachs { record, attachs } => Some(RecordType::from((
+                    Record {
+                        timestamp: max(near_sec, record.timestamp) + 1,
+                        ..record.clone()
+                    },
+                    attachs,
+                ))),
+                _ => None,
+            }
+        } else {
+            Some(record_type)
+        }
     }
 }
 
@@ -273,20 +301,23 @@ impl MsgMatcher for QQMsgMatcher {
                             Some(line @ QQMsgLine::Message { .. }) => {
                                 self.transfrom_record(group_id.clone(), date.clone(), line)
                                     .map(|record_type| {
-                                        record_type.get_record().map(|record| {
-                                            ret.push(Self::modify_timestamp(
-                                                record_type.clone(),
-                                                ret.iter()
-                                                    .filter_map(|r| r.get_record())
-                                                    .filter(|r| {
-                                                        i64::abs(r.timestamp - record.timestamp)
-                                                            < 1000
-                                                            && r.sender == record.sender
-                                                    })
-                                                    .map(|r| r.timestamp)
-                                                    .max(),
-                                            ))
-                                        })
+                                        record_type
+                                            .get_record()
+                                            .and_then(|record| {
+                                                Self::modify_timestamp(
+                                                    record_type.clone(),
+                                                    ret.iter()
+                                                        .filter_map(|r| r.get_record())
+                                                        .filter(|r| {
+                                                            i64::abs(r.timestamp - record.timestamp)
+                                                                < 1000
+                                                                && r.sender == record.sender
+                                                        })
+                                                        .map(|r| r.timestamp)
+                                                        .max(),
+                                                )
+                                            })
+                                            .map(|record| ret.push(record))
                                     });
                                 (date, ret)
                             }
