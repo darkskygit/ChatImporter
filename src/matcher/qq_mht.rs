@@ -52,14 +52,17 @@ impl QQMhtAttachGetter {
 
 impl QQAttachGetter for QQMhtAttachGetter {
     fn get_attach(&self, path: &str) -> QQMsgImage {
-        let path = PathBuf::from(path)
+        let name = PathBuf::from(path)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(path)
             .to_string();
         self.attachs
-            .get(&path)
-            .map(|data| QQMsgImage::Attach(data.clone()))
-            .unwrap_or_else(|| QQMsgImage::UnmatchName(path))
+            .get(&name)
+            .map(|data| QQMsgImage::Attach {
+                data: data.clone(),
+                name: name.clone(),
+            })
+            .unwrap_or_else(|| QQMsgImage::UnmatchName(name))
     }
 }

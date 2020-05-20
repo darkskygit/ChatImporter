@@ -6,9 +6,10 @@ use serde_json::to_vec;
 use std::cmp::max;
 use std::path::PathBuf;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub enum QQMsgImage {
-    Attach(Vec<u8>),
+    Attach { name: String, data: Vec<u8> },
+    Hash(i64),
     UnmatchName(String),
 }
 
@@ -220,19 +221,39 @@ impl QQMsgMatcher {
             } = line
             {
                 if msg.images.len() > 0 {
-                    // to_vec(&msg.images).ok().and_then(|metadata| {
-                    //     Some(Record {
-                    //         chat_type: "QQ".into(),
-                    //         owner_id: self.owner.clone(),
-                    //         group_id,
-                    //         sender: sender_id,
-                    //         content: msg.content,
-                    //         timestamp: date.and_time(time).timestamp_millis(),
-                    //         metadata: Some(metadata),
-                    //         ..Default::default()
-                    //     })
-                    // });
-                    None
+                    to_vec(
+                        &msg.images
+                            .iter()
+                            .map(|image| match image {
+                                QQMsgImage::Attach { data, .. } => {
+                                    QQMsgImage::Hash(Blob::new(data.clone()).hash)
+                                }
+                                other => other.clone(),
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .ok()
+                    .and_then(|metadata| {
+                        Some(RecordType::from((
+                            Record {
+                                chat_type: "QQ".into(),
+                                owner_id: self.owner.clone(),
+                                group_id,
+                                sender: sender_id,
+                                content: msg.content,
+                                timestamp: date.and_time(time).timestamp_millis(),
+                                metadata: Some(metadata),
+                                ..Default::default()
+                            },
+                            msg.images
+                                .iter()
+                                .filter_map(|image| match image.clone() {
+                                    QQMsgImage::Attach { data, name } => Some((name, data)),
+                                    _ => None,
+                                })
+                                .collect(),
+                        )))
+                    })
                 } else {
                     Some(RecordType::from(Record {
                         chat_type: "QQ".into(),

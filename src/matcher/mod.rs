@@ -2,6 +2,7 @@ mod qq_html;
 mod qq_mht;
 
 use super::*;
+use gchdb::{Blob, Record, RecordType};
 use htmlescape::decode_html;
 use lazy_static::lazy_static;
 use regex::{Captures, Regex};

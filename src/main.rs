@@ -1,7 +1,7 @@
 mod matcher;
 
 use anyhow::{Context, Result};
-use gchdb::{ChatRecoder, Record, RecordType, SqliteChatRecorder};
+use gchdb::{ChatRecoder, SqliteChatRecorder};
 use log::{error, warn};
 use matcher::{MsgMatcher, QQMhtMsgMatcher};
 use std::fs::read;
