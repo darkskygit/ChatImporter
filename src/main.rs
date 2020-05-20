@@ -21,7 +21,7 @@ fn main() -> Result<()> {
             progress = (i + 1) as f64 / records.len() as f64;
             println!(
                 "current progress: {}%, {}/{}, {}ms",
-                progress,
+                progress * 100.0,
                 i,
                 records.len(),
                 sw.elapsed().as_millis()
