@@ -1,12 +1,16 @@
 mod qq_html;
+mod qq_mht;
 
 use super::*;
 use htmlescape::decode_html;
 use lazy_static::lazy_static;
 use regex::{Captures, Regex};
 
-pub use qq_html::{QQAttachGetter, QQMsgMatcher, QQPathAttachGetter};
+use qq_html::{QQAttachGetter, QQMsgImage};
+
+pub use qq_html::{QQMsgMatcher, QQPathAttachGetter};
+pub use qq_mht::QQMhtMsgMatcher;
 
 pub trait MsgMatcher {
-    fn get_records(&self) -> Option<Vec<Record>>;
+    fn get_records(&self) -> Option<Vec<RecordType>>;
 }

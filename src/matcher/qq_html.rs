@@ -6,9 +6,9 @@ use serde_json::to_vec;
 use std::cmp::max;
 use std::path::PathBuf;
 
-#[derive(Clone, Serialize)]
-enum QQMsgImage {
-    Attach(Attachment),
+#[derive(Clone)]
+pub enum QQMsgImage {
+    Attach(Vec<u8>),
     UnmatchName(String),
 }
 
@@ -41,6 +41,7 @@ pub trait QQAttachGetter {
     }
 }
 
+#[allow(dead_code)]
 pub struct QQPathAttachGetter;
 
 impl QQAttachGetter for QQPathAttachGetter {}
@@ -204,12 +205,12 @@ impl QQMsgMatcher {
         }
     }
 
-    fn transfrom_record(
-        &self,
+    fn transfrom_record<'a>(
+        &'a self,
         group_id: String,
         date: Option<NaiveDate>,
         line: QQMsgLine,
-    ) -> Option<Record> {
+    ) -> Option<RecordType> {
         date.and_then(|date| {
             if let QQMsgLine::Message {
                 sender,
@@ -219,20 +220,21 @@ impl QQMsgMatcher {
             } = line
             {
                 if msg.images.len() > 0 {
-                    to_vec(&msg.images).ok().and_then(|metadata| {
-                        Some(Record {
-                            chat_type: "QQ".into(),
-                            owner_id: self.owner.clone(),
-                            group_id,
-                            sender: sender_id,
-                            content: msg.content,
-                            timestamp: date.and_time(time).timestamp_millis(),
-                            metadata: Some(metadata),
-                            ..Default::default()
-                        })
-                    })
+                    // to_vec(&msg.images).ok().and_then(|metadata| {
+                    //     Some(Record {
+                    //         chat_type: "QQ".into(),
+                    //         owner_id: self.owner.clone(),
+                    //         group_id,
+                    //         sender: sender_id,
+                    //         content: msg.content,
+                    //         timestamp: date.and_time(time).timestamp_millis(),
+                    //         metadata: Some(metadata),
+                    //         ..Default::default()
+                    //     })
+                    // });
+                    None
                 } else {
-                    Some(Record {
+                    Some(RecordType::from(Record {
                         chat_type: "QQ".into(),
                         owner_id: self.owner.clone(),
                         group_id,
@@ -240,17 +242,21 @@ impl QQMsgMatcher {
                         content: msg.content,
                         timestamp: date.and_time(time).timestamp_millis(),
                         ..Default::default()
-                    })
+                    }))
                 }
             } else {
                 None
             }
         })
     }
+
+    fn modify_timestamp(record_type: RecordType, near_sec: Option<i64>) -> RecordType {
+        record_type
+    }
 }
 
 impl MsgMatcher for QQMsgMatcher {
-    fn get_records(&self) -> Option<Vec<Record>> {
+    fn get_records(&self) -> Option<Vec<RecordType>> {
         self.get_table().and_then(|table| {
             Self::get_group_id(table.iter().take(4).collect::<Vec<_>>()).map(|group_id| {
                 table
@@ -258,7 +264,7 @@ impl MsgMatcher for QQMsgMatcher {
                     .skip(4)
                     .map(|elm| self.transfrom_msg_line(elm))
                     .fold(
-                        (None, Vec::<Record>::new()),
+                        (None, Vec::<RecordType>::new()),
                         |(date, mut ret), curr| match curr {
                             Some(QQMsgLine::Date(date)) => (
                                 Some(NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap()),
@@ -266,19 +272,21 @@ impl MsgMatcher for QQMsgMatcher {
                             ),
                             Some(line @ QQMsgLine::Message { .. }) => {
                                 self.transfrom_record(group_id.clone(), date.clone(), line)
-                                    .map(|mut record| {
-                                        if let Some(some_sec) = ret
-                                            .iter()
-                                            .filter(|r| {
-                                                i64::abs(r.timestamp - record.timestamp) < 1000
-                                                    && r.sender == record.sender
-                                            })
-                                            .map(|r| r.timestamp)
-                                            .max()
-                                        {
-                                            record.timestamp = max(some_sec, record.timestamp) + 1;
-                                        }
-                                        ret.push(record)
+                                    .map(|record_type| {
+                                        record_type.get_record().map(|record| {
+                                            ret.push(Self::modify_timestamp(
+                                                record_type.clone(),
+                                                ret.iter()
+                                                    .filter_map(|r| r.get_record())
+                                                    .filter(|r| {
+                                                        i64::abs(r.timestamp - record.timestamp)
+                                                            < 1000
+                                                            && r.sender == record.sender
+                                                    })
+                                                    .map(|r| r.timestamp)
+                                                    .max(),
+                                            ))
+                                        })
                                     });
                                 (date, ret)
                             }

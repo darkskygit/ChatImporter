@@ -1,25 +1,25 @@
 mod matcher;
 
 use anyhow::{Context, Result};
-use gchdb::{Attachment, ChatRecoder, Record, SqliteChatRecorder};
+use gchdb::{ChatRecoder, Record, RecordType, SqliteChatRecorder};
 use log::{error, warn};
-use matcher::{MsgMatcher, QQMsgMatcher, QQPathAttachGetter};
-use std::fs::read_to_string;
+use matcher::{MsgMatcher, QQMhtMsgMatcher};
+use std::fs::read;
 use std::path::Path;
 
 fn main() -> Result<()> {
     let mut recorder = SqliteChatRecorder::new("record.db")?;
-    for record in transfrom_chat_to_records("test.html")? {
-        if !recorder.insert_or_update_record(&record)? {
-            warn!("Failed to insert record: {}", record.content);
+    if let Some(records) = QQMhtMsgMatcher::new(&read("test.mht")?, "test".into())?.get_records() {
+        for record in records {
+            let content = record
+                .get_record()
+                .map(|r| r.content.clone())
+                .unwrap_or_default();
+            if !recorder.insert_or_update_record(record)? {
+                warn!("Failed to insert record: {}", content);
+            }
         }
     }
     recorder.refresh_index()?;
     Ok(())
-}
-
-fn transfrom_chat_to_records<P: AsRef<Path>>(path: P) -> Result<Vec<Record>> {
-    QQMsgMatcher::new(read_to_string(path)?, "test".into(), QQPathAttachGetter)
-        .get_records()
-        .context("Cannot transfrom records")
 }
