@@ -6,11 +6,19 @@ This tool is based on another crate [gchdb](https://github.com/darkskygit/GCHDB)
 
 # Now support & Todo
 
-- [x] PC QQ Lite up to 6.7's Mht backup files
+- [x] PC QQ Lite up to 6.7's Mht backup files (system messages can't parse now)
 - [ ] Wechat iOS (need help, welcome pr?)
 - [ ] Wechat Android (need help, welcome pr?)
 - [ ] iMessages / Normal iOS Message 
 - [ ] Android Messages
+
+# Usage
+
+Backup your qq chat records into mht files in QQ's chat history manager and don't rename them.
+
+``` sh
+cargo run --release -- -o your_qq_number <mht_folder_path>
+```
 
 # Contributing
 
