@@ -795,6 +795,8 @@ dependencies = [
 [[package]]
 name = "gchdb"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42d0514c766558097eb936401fdffe46cb0e280a17b14c3dd1ecb71c8daee42b"
 dependencies = [
  "anyhow",
  "cang-jie",
