@@ -38,14 +38,10 @@ pub fn qq_mht_importer<P: AsRef<Path>>(
     let mut progress = 0.0;
     let mut sw = Instant::now();
     for (i, record) in records.iter().enumerate() {
-        let content = record
-            .get_record()
-            .map(|r| r.content.clone())
-            .unwrap_or_default();
         if (i + 1) as f64 / records.len() as f64 - progress > 0.01 {
             progress = (i + 1) as f64 / records.len() as f64;
             info!(
-                "current progress: {}%, {}/{}, {}ms",
+                "current progress: {:.2}%, {}/{}, {}ms",
                 progress * 100.0,
                 i,
                 records.len(),
@@ -54,6 +50,10 @@ pub fn qq_mht_importer<P: AsRef<Path>>(
             sw = Instant::now();
         }
         if !recorder.insert_or_update_record(record.clone())? {
+            let content = record
+                .get_record()
+                .map(|r| r.content.clone())
+                .unwrap_or_default();
             warn!("Failed to insert record: {}", content);
         }
     }

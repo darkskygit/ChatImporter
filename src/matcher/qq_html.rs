@@ -78,9 +78,9 @@ impl QQMsgMatcher {
             .map(|elm| elm.select(&*TR_TD_SELECTOR).collect())
     }
 
-    fn first_match<'t>(captures: Option<Captures<'t>>) -> Option<String> {
+    fn first_match(captures: Option<Captures<'_>>) -> Option<String> {
         captures
-            .and_then(|c| c.iter().skip(1).next().and_then(|i| i))
+            .and_then(|c| c.iter().nth(1).and_then(|i| i))
             .map(|i| i.as_str().trim().into())
     }
 
@@ -121,7 +121,7 @@ impl QQMsgMatcher {
                         .iter()
                         .skip(1)
                         .take(2)
-                        .filter_map(|i| i.clone())
+                        .flatten()
                         .map(|i| i.as_str().trim().to_string())
                         .collect::<Vec<_>>()
                         .as_slice()
@@ -157,7 +157,7 @@ impl QQMsgMatcher {
                                 .iter()
                                 .skip(1)
                                 .take(2)
-                                .filter_map(|i| i.clone())
+                                .flatten()
                                 .map(|i| i.as_str().trim().to_string())
                                 .collect::<Vec<_>>()
                                 .as_slice()
@@ -181,8 +181,7 @@ impl QQMsgMatcher {
 
     fn parse_time(name: &ElementRef) -> Option<NaiveTime> {
         name.children()
-            .skip(1)
-            .next()
+            .nth(1)
             .and_then(|nodereef| match nodereef.value() {
                 Node::Text(text) => Some(text),
                 _ => None,
@@ -237,7 +236,7 @@ impl QQMsgMatcher {
             static ref U_REPLACER: Regex = Regex::new("<u>(?P<text>.*?)</u>").unwrap();
             static ref IMG_REPLACER: Regex = Regex::new(r#"<img src="(?P<img>.*?)">"#).unwrap();
         }
-        let decoded = decode_html(&content.inner_html()).unwrap_or(content.inner_html());
+        let decoded = decode_html(&content.inner_html()).unwrap_or_else(|_| content.inner_html());
         Some(QQMsg {
             content: [
                 (&*FONT_REPLACER, "$text"),
@@ -263,7 +262,7 @@ impl QQMsgMatcher {
             static ref DIV_SELECTOR: Selector = Selector::parse("tr>td>div").unwrap();
         }
         let divs = elm.select(&*DIV_SELECTOR).take(2).collect::<Vec<_>>();
-        if let &[name, content] = divs.as_slice() {
+        if let [name, content] = *divs.as_slice() {
             self.process_name(name, is_pm)
                 .and_then(|(sender_name, sender_id, time)| {
                     self.process_msg(content).map(|msg| QQMsgLine::Message {
@@ -278,8 +277,8 @@ impl QQMsgMatcher {
         }
     }
 
-    fn transfrom_record<'a>(
-        &'a self,
+    fn transfrom_record(
+        &self,
         group_id: String,
         date: Option<NaiveDate>,
         line: QQMsgLine,
@@ -292,7 +291,7 @@ impl QQMsgMatcher {
                 msg,
             } = line
             {
-                if msg.images.len() > 0 {
+                if !msg.images.is_empty() {
                     to_vec(
                         &msg.images
                             .iter()
@@ -305,8 +304,8 @@ impl QQMsgMatcher {
                             .collect::<Vec<_>>(),
                     )
                     .ok()
-                    .and_then(|metadata| {
-                        Some(RecordType::from((
+                    .map(|metadata| {
+                        RecordType::from((
                             Record {
                                 chat_type: "QQ".into(),
                                 owner_id: self.owner.clone(),
@@ -325,7 +324,7 @@ impl QQMsgMatcher {
                                     _ => None,
                                 })
                                 .collect(),
-                        )))
+                        ))
                     })
                 } else {
                     Some(RecordType::from(Record {
@@ -382,6 +381,11 @@ impl MsgMatcher for QQMsgMatcher {
     fn get_records(&self) -> Option<Vec<RecordType>> {
         self.get_table().and_then(|table| {
             Self::get_group_id(table.iter().take(4).collect::<Vec<_>>()).map(|(is_pm, group_id)| {
+                let group_id = if is_pm || group_id != "0" {
+                    group_id
+                } else {
+                    self.file_name.clone()
+                };
                 table
                     .iter()
                     .skip(4)
@@ -394,8 +398,8 @@ impl MsgMatcher for QQMsgMatcher {
                                 ret,
                             ),
                             Some(line @ QQMsgLine::Message { .. }) => {
-                                self.transfrom_record(group_id.clone(), date.clone(), line)
-                                    .map(|record_type| {
+                                self.transfrom_record(group_id.clone(), date, line).map(
+                                    |record_type| {
                                         record_type
                                             .get_record()
                                             .and_then(|record| {
@@ -413,7 +417,8 @@ impl MsgMatcher for QQMsgMatcher {
                                                 )
                                             })
                                             .map(|record| ret.push(record))
-                                    });
+                                    },
+                                );
                                 (date, ret)
                             }
                             None => (date, ret),

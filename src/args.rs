@@ -26,15 +26,16 @@ impl Args {
     }
 }
 
-fn check_path<S: ToString>(src: S) -> Result<PathBuf, Error> {
-    let path = PathBuf::from(src.to_string()).absolutize()?;
+fn check_path<S: AsRef<str>>(src: S) -> Result<PathBuf, Error> {
+    let path = PathBuf::from(src.as_ref());
+    let path = path.absolutize()?;
     if !path.exists() {
         Err(Error::new(
             ErrorKind::NotFound,
             format!("路径不存在: {}", path.display()),
         ))
     } else {
-        Ok(path)
+        Ok(path.into())
     }
 }
 
