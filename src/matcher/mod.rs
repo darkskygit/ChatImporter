@@ -1,3 +1,4 @@
+mod ios_sms;
 mod qq_html;
 mod qq_mht;
 
