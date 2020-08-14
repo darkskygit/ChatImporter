@@ -1,0 +1,31 @@
+[package]
+name = "ibackuptool2"
+version = "0.1.0"
+authors = ["Rich Infante <rich@richinfante.com>"]
+edition = "2018"
+
+[dependencies]
+rusqlite = "0.23.1"
+plist = "1.0.0"
+dirs = "3.0.1"
+serde_bytes = "0.11.5"
+hex = "0.4.2"
+ring = "0.16.15"
+tempfile = "3.1.0"
+chrono = "0.4.13"
+
+[dependencies.log]
+version = "0.4.11"
+features = ["max_level_trace", "release_max_level_info"]
+
+[dependencies.libsqlite3-sys]
+version = "0.18.0"
+features = ["bundled"]
+
+[dependencies.serde]
+version = "1.0.115"
+features = ["derive"]
+
+[dependencies.uuid]
+version = "0.8.1"
+features = ["v4"]

@@ -21,6 +21,9 @@ serde = "1.0.115"
 serde_json = "1.0.57"
 walkdir = "2.3.1"
 
+[dependencies.ibackuptool2]
+path = "lib/ibackuptool2"
+
 [dependencies.log]
 version = "0.4.11"
 features = ["max_level_trace", "release_max_level_info"]
