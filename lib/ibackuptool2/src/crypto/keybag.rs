@@ -1,10 +1,8 @@
 use log::debug;
 
-use hex;
-use uuid::Uuid;
-
 use super::*;
 use ring::pbkdf2;
+use uuid::Uuid;
 
 #[derive(Debug)]
 pub struct KeyBag {
@@ -90,7 +88,7 @@ impl KeyBag {
             root_entries.push(block.clone());
         }
 
-        return root_entries;
+        root_entries
     }
 
     pub fn unlock_with_key(&mut self, passcode_key: Vec<u8>) {
@@ -273,10 +271,10 @@ impl KeyBag {
             version: version.unwrap(),
             uuid: uuid.unwrap(),
             kind: kind.unwrap(),
-            iterations: iterations,
-            dpwt: dpwt,
-            dpic: dpic,
-            double_protection_salt: double_protection_salt,
+            iterations,
+            dpwt,
+            dpic,
+            double_protection_salt,
             salt: salt.unwrap(),
             hmck: hmck.unwrap(),
             wrap: wrap.unwrap(),
@@ -352,9 +350,9 @@ impl KeyBag {
 
     fn get_u8_4(vec: &[u8]) -> Option<[u8; 4]> {
         if vec.len() < 4 {
-            return None;
+            None
         } else {
-            return Some([vec[0], vec[1], vec[2], vec[3]]);
+            Some([vec[0], vec[1], vec[2], vec[3]])
         }
     }
 

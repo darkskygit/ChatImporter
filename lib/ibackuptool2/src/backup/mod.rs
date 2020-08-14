@@ -10,33 +10,38 @@ pub use manifest::{BackupManifest, BackupManifestLockdown};
 pub use status::BackupStatus;
 
 use std::convert::TryFrom;
-use std::path::Path;
+use std::fs::{read, write};
+use std::path::{Path, PathBuf};
 
 use rusqlite::OpenFlags;
 use rusqlite::{Connection, NO_PARAMS};
 
 #[derive(Debug)]
-pub struct Backup<'a> {
-    pub path: Box<&'a Path>,
+pub struct Backup {
+    pub path: PathBuf,
     pub manifest: BackupManifest,
     pub info: BackupInfo,
     pub status: BackupStatus,
     pub files: Vec<BackupFile>,
 }
 
-impl Backup<'_> {
+impl Backup {
     /// Create from root backup path.
-    pub fn new(path: &Path) -> Result<Backup, Box<dyn std::error::Error>> {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Backup, Box<dyn std::error::Error>> {
         use ::plist::from_file;
-        let status: BackupStatus = from_file(format!("{}/Status.plist", path.to_str().unwrap()))?;
+        let status: BackupStatus =
+            from_file(format!("{}/Status.plist", path.as_ref().to_str().unwrap()))?;
 
-        let info: BackupInfo = from_file(format!("{}/Info.plist", path.to_str().unwrap()))?;
+        let info: BackupInfo =
+            from_file(format!("{}/Info.plist", path.as_ref().to_str().unwrap()))?;
 
-        let manifest: BackupManifest =
-            from_file(format!("{}/Manifest.plist", path.to_str().unwrap()))?;
+        let manifest: BackupManifest = from_file(format!(
+            "{}/Manifest.plist",
+            path.as_ref().to_str().unwrap()
+        ))?;
 
         Ok(Backup {
-            path: Box::new(path.clone()),
+            path: path.as_ref().to_path_buf(),
             manifest,
             status,
             info,
@@ -98,7 +103,7 @@ impl Backup<'_> {
             return Err(BackupError::InManifestButNotFound.into());
         }
 
-        let contents = std::fs::read(&finpath).expect("contents to exist");
+        let contents = read(&finpath).expect("contents to exist");
 
         // if the file
         if self.manifest.is_encrypted {
@@ -120,10 +125,7 @@ impl Backup<'_> {
             }
         }
 
-        return match std::fs::read(Path::new(&path)) {
-            Ok(vec) => Ok(vec),
-            Err(err) => Err(err.into()),
-        };
+        read(Path::new(&path)).map_err(|e| e.into())
     }
 
     /// Unwrap all individual file encryption keys
@@ -152,7 +154,7 @@ impl Backup<'_> {
         let conn: Connection;
         if self.manifest.is_encrypted {
             let path = format!("{}/Manifest.db", self.path.to_str().unwrap());
-            let contents = std::fs::read(Path::new(&path)).unwrap();
+            let contents = read(Path::new(&path)).unwrap();
             let dec = decrypt_with_key(
                 &self.manifest.manifest_key_unwrapped.as_ref().unwrap(),
                 &contents,
@@ -169,7 +171,7 @@ impl Backup<'_> {
             let pth = format!("{}/Downloads/decrypted_database.sqlite", home_dir);
             trace!("writing decrypted database: {}", pth);
             let decpath = Path::new(&pth);
-            std::fs::write(&decpath, dec).unwrap();
+            write(&decpath, dec).unwrap();
 
             conn = Connection::open_with_flags(&decpath, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         } else {

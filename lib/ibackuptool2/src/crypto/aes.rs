@@ -22,7 +22,7 @@ pub fn decrypt_with_key(key: &Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
 
     let result = dec.decrypt(&mut input, &mut output, true);
     trace!("decrypt: is_err: {}", result.is_err());
-    return out;
+    out
 }
 
 pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Vec<u8> {
@@ -131,5 +131,5 @@ pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Vec<u8> {
 
     trace!("decrypt result: {}", hex::encode(&result));
 
-    return result;
+    result
 }

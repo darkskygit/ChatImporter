@@ -14,7 +14,7 @@ impl OutFile {
     }
 
     pub fn contents(&self) -> &[u8] {
-        return self.contents.as_slice();
+        self.contents.as_slice()
     }
 }
 

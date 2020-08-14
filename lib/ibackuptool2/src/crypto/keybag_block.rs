@@ -38,7 +38,7 @@ impl From<&str> for KeybagBlockTag {
             "DPSL" => KeybagBlockTag::DPSL,
             x => {
                 warn!("unknown tag type: {}", x);
-                return KeybagBlockTag::Unknown;
+                KeybagBlockTag::Unknown
             }
         }
     }

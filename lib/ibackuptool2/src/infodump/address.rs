@@ -86,36 +86,24 @@ impl AddressBookIndexed {
         let normalized = normalize_phone(phone);
 
         if self.index.contains_key(&normalized) {
-            match self.index.get(&normalized) {
-                Some(res) => {
-                    if res.len() > 0 {
-                        return Some(res);
-                    } else {
-                        return None;
-                    }
+            if let Some(res) = self.index.get(&normalized) {
+                if res.len() > 0 {
+                    return Some(res);
                 }
-                None => return None,
             }
-        } else {
-            return None;
         }
+        None
     }
 
     pub fn raw_search(&self, query: &str) -> Option<&Vec<Box<Contact>>> {
         if self.index.contains_key(query) {
-            match self.index.get(query) {
-                Some(res) => {
-                    if res.len() > 0 {
-                        return Some(res);
-                    } else {
-                        return None;
-                    }
+            if let Some(res) = self.index.get(query) {
+                if res.len() > 0 {
+                    return Some(res);
                 }
-                None => return None,
             }
-        } else {
-            return None;
         }
+        None
     }
 }
 
@@ -282,31 +270,28 @@ fn normalize_phone(string: &str) -> String {
         return string1.replacen("1", "", 1);
     }
 
-    return string1;
+    string1
 }
 
 /// Normalized compare of phone numbers
 pub fn heuristic_phone_same(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-
-    return normalize_phone(a) == normalize_phone(b);
+    a == b || normalize_phone(a) == normalize_phone(b)
 }
 
 pub fn get_properties_of_type(
     kind: PropertyType,
     inside: &Vec<(PropertyType, PropertyLabel, String)>,
 ) -> Vec<(PropertyLabel, String)> {
-    return inside
+    inside
         .iter()
         .flat_map(|(t, l, v)| {
             if t == &kind {
-                return Some((*l, v.clone()));
+                Some((*l, v.clone()))
+            } else {
+                None
             }
-            return None;
         })
-        .collect::<Vec<(PropertyLabel, String)>>();
+        .collect()
 }
 
 pub fn load_address_book(conn: &Connection) -> Result<AddressBook, Box<dyn std::error::Error>> {
