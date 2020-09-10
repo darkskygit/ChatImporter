@@ -1,10 +1,12 @@
 mod ios_sms;
+mod ios_wechat;
 mod qq_html;
 mod qq_mht;
 
 use gchdb::{Blob, Record, RecordType};
 use htmlescape::decode_html;
 use lazy_static::lazy_static;
+use path_ext::PathExt;
 use regex::{Captures, Regex};
 
 use qq_html::{QQAttachGetter, QQMsgImage};

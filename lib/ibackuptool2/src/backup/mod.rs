@@ -79,12 +79,25 @@ impl Backup {
     #[allow(dead_code)]
     pub fn find_path(&self, domain: &str, path: &str) -> Option<BackupFile> {
         for file in &self.files {
-            if file.relative_filename == path && file.domain == domain {
+            if file.domain == domain && file.relative_filename == path {
                 return Some(file.clone());
             }
         }
 
         return None;
+    }
+
+    #[allow(dead_code)]
+    pub fn find_wildcard_paths(&self, domain: &str, path: &str) -> Vec<BackupFile> {
+        use wildmatch::WildMatch;
+        let matcher = WildMatch::new(path);
+        let mut paths = vec![];
+        for file in &self.files {
+            if file.domain == domain && matcher.is_match(&file.relative_filename) {
+                paths.push(file.clone());
+            }
+        }
+        return paths;
     }
 
     #[allow(dead_code)]
