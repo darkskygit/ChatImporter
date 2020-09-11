@@ -1,8 +1,6 @@
 use super::*;
-use chrono::{Duration, TimeZone, Utc};
 use ibackuptool2::{Backup, BackupFile};
 use plist::Value;
-use rusqlite::{params, Connection, OpenFlags, Result as SqliteResult};
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -101,12 +99,12 @@ impl UserDB {
 }
 
 #[allow(non_camel_case_types)]
-pub struct iOSWeChatMatcher {
+struct iOSWeChatExtractor {
     backup: Backup,
     user_info: HashMap<String, UserDB>,
 }
 
-impl iOSWeChatMatcher {
+impl iOSWeChatExtractor {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let mut backup = Backup::new(path)?;
         backup.parse_manifest()?;
@@ -115,7 +113,7 @@ impl iOSWeChatMatcher {
     }
 
     fn get_user_info(backup: &Backup) -> HashMap<String, UserDB> {
-        const domain: &str = "AppDomain-com.tencent.xin";
+        const DOMAIN: &str = "AppDomain-com.tencent.xin";
         const MATCHED_NAME: [&str; 4] = [
             "WCDB_Contact.sqlite",
             "MM.sqlite",
@@ -124,10 +122,10 @@ impl iOSWeChatMatcher {
         ];
         let mut user_map = HashMap::new();
         let paths = vec![
-            backup.find_wildcard_paths(domain, "*/WCDB_Contact.sqlite"),
-            backup.find_wildcard_paths(domain, "*/MM.sqlite"),
-            backup.find_wildcard_paths(domain, "*/mmsetting.archive"),
-            backup.find_wildcard_paths(domain, "*/session/session.db"),
+            backup.find_wildcard_paths(DOMAIN, "*/WCDB_Contact.sqlite"),
+            backup.find_wildcard_paths(DOMAIN, "*/MM.sqlite"),
+            backup.find_wildcard_paths(DOMAIN, "*/mmsetting.archive"),
+            backup.find_wildcard_paths(DOMAIN, "*/session/session.db"),
         ];
         for file in paths.iter().flatten() {
             let path = Path::new(&file.relative_filename);
@@ -138,13 +136,13 @@ impl iOSWeChatMatcher {
                     .and_then(|p| p.components().next())
                     .map(|user_id| user_id.name_str().to_string())
                 {
-                        if let Some(user) = user_map.remove(&user_id) {
-                            let user: UserDB = user;
-                            user_map.insert(user_id, user.with(file));
-                        } else {
-                            user_map.insert(user_id.clone(), UserDB::new(user_id, file));
-                        }
+                    if let Some(user) = user_map.remove(&user_id) {
+                        let user: UserDB = user;
+                        user_map.insert(user_id, user.with(file));
                     } else {
+                        user_map.insert(user_id.clone(), UserDB::new(user_id, file));
+                    }
+                } else {
                     warn!("Unmatched path: {}", path.display());
                 }
             } else {
@@ -162,6 +160,24 @@ impl iOSWeChatMatcher {
                     .ok()
             })
             .collect()
+    }
+}
+
+#[allow(non_camel_case_types)]
+pub struct iOSWeChatMsgMatcher {
+    extractor: iOSWeChatExtractor,
+}
+
+impl iOSWeChatMsgMatcher {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Box<dyn MsgMatcher>> {
+        let extractor = iOSWeChatExtractor::new(path).map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(Box::new(Self { extractor }) as Box<dyn MsgMatcher>)
+    }
+}
+
+impl MsgMatcher for iOSWeChatMsgMatcher {
+    fn get_records(&self) -> Option<Vec<RecordType>> {
+        todo!()
     }
 }
 

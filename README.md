@@ -9,7 +9,7 @@ This tool is based on another crate [gchdb](https://github.com/darkskygit/GCHDB)
 - [x] PC QQ Lite up to 6.7's Mht backup files (system messages can't parse now)
 - [ ] Wechat iOS (need help, welcome pr?)
 - [ ] Wechat Android (need help, welcome pr?)
-- [ ] iMessages / Normal iOS Message 
+- [x] iMessages / Normal iOS Message 
 - [ ] Android Messages
 
 # Usage

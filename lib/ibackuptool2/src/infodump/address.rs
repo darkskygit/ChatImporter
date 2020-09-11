@@ -161,6 +161,7 @@ const ASSISTANT_ID: i64 = 41;
 const MANAGER_ID: i64 = 42;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
+#[allow(non_camel_case_types)]
 pub enum PropertyLabel {
     Home,
     Other,
