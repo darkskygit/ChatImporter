@@ -1,18 +1,66 @@
 use super::*;
+use binread::*;
 use ibackuptool2::{Backup, BackupFile};
 use plist::Value;
 use rusqlite::{params, Connection, OpenFlags, Result as SqliteResult};
 use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind, Write};
+use std::str::{from_utf8, Utf8Error};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
+#[derive(BinRead)]
+#[br(little, magic = b"\n")]
+struct ContactRemark {
+    _len: u8,
+    #[br(count = _len)]
+    remark: Vec<u8>,
+}
+
+impl ContactRemark {
+    pub fn get_remark(&self) -> Result<&str, Utf8Error> {
+        from_utf8(&self.remark)
+    }
+}
+
 #[derive(Clone)]
 struct Contact {
-    name: String,
-    remark: String,
-    head: String,
-    user_type: i32,
+    pub name: String,
+    remark: Vec<u8>,
+    head: Vec<u8>,
+    pub user_type: i32,
+}
+
+impl Contact {
+    pub fn get_remark(&self) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(Cursor::new(&self.remark)
+            .read_le::<ContactRemark>()?
+            .get_remark()?
+            .into())
+    }
+
+    pub fn get_image(&self) -> Result<Option<String>, Utf8Error> {
+        lazy_static! {
+            static ref URL_MATCHER: Regex =
+                Regex::new(r"(http://[a-zA-Z\./_\d]*/0)([^a-zA-Z\./_\d]|$)").unwrap();
+        }
+        Ok(URL_MATCHER
+            .captures(from_utf8(&self.head)?)
+            .and_then(|c| c.iter().nth(1).and_then(|i| i))
+            .map(|i| i.as_str().trim().into()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ChatLine {
+    local_id: i64,
+    server_id: i64,
+    created_time: i64,
+    message: String,
+    status: u8,
+    image_status: u8,
+    msg_type: u8,
+    is_dest: bool,
 }
 
 #[derive(Clone, Default)]
@@ -162,34 +210,76 @@ impl UserDB {
                 .query_map(params![], |row| {
                     Ok(Contact {
                         name: row.get(0)?,
-                        remark: {
-                            let remark: String = row.get(1)?;
-                            if remark.len() > 2
-                                && remark.chars().next() == Some('\n')
-                                && remark.chars().nth(1) >= Some('\0')
-                                && remark.chars().nth(1) <= Some('0')
-                            {
-                                let mut chars = vec![];
-                                for c in remark.chars().nth(2) {
-                                    if c < '\u{0012}' || c > '\u{0016}' {
-                                        chars.push(c);
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                chars.iter().cloned().collect::<String>()
-                            } else {
-                                remark
-                            }
-                        },
+                        remark: row.get(1)?,
                         head: row.get(2)?,
                         user_type: row.get(3)?,
                     })
                 })?
-                .filter_map(|r| r.ok())
+                .filter_map(|r| r.map_err(|e| warn!("failed to parse contact: {}", e)).ok())
                 .collect();
         }
         Ok(())
+    }
+
+    pub fn get_contacts(&self) -> Vec<String> {
+        self.find_contacts("")
+    }
+
+    pub fn find_contacts<S: ToString>(&self, name: S) -> Vec<String> {
+        let name = name.to_string();
+        self.contacts
+            .iter()
+            .filter(|c| {
+                if name.is_empty() {
+                    true
+                } else {
+                    c.name.find(&name).is_some()
+                        || c.get_remark().ok().and_then(|r| r.find(&name)).is_some()
+                }
+            })
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
+    fn gen_md5<S: ToString>(user_name: S) -> String {
+        use md5::{Digest, Md5};
+        format!("{:x}", Md5::digest(user_name.to_string().as_bytes()))
+    }
+
+    pub fn load_chat<S: ToString>(&self, user_name: S) -> SqliteResult<Vec<ChatLine>> {
+        if let Some(conn) = Self::get_conn(self.message.clone())? {
+            Ok(conn
+                .prepare(&format!(
+                    "SELECT
+                        MesLocalID,
+                        MesSvrID,
+                        CreateTime,
+                        Message,
+                        Status,
+                        ImgStatus,
+                        Type,
+                        Des
+                    FROM
+                        Chat_{}",
+                    Self::gen_md5(user_name)
+                ))?
+                .query_map(params![], |row| {
+                    Ok(ChatLine {
+                        local_id: row.get(0)?,
+                        server_id: row.get(1)?,
+                        created_time: row.get(2)?,
+                        message: row.get(3)?,
+                        status: row.get(4)?,
+                        image_status: row.get(5)?,
+                        msg_type: row.get(6)?,
+                        is_dest: row.get(7)?,
+                    })
+                })?
+                .filter_map(|r| r.map_err(|e| warn!("failed to parse contact: {}", e)).ok())
+                .collect())
+        } else {
+            Ok(vec![])
+        }
     }
 }
 
@@ -266,6 +356,14 @@ impl iOSWeChatExtractor {
                     .ok()
             })
             .collect()
+    }
+
+    pub fn get_users(&self) -> Vec<String> {
+        self.user_info.keys().cloned().collect()
+}
+
+    pub fn get_user_db(&self, user: &str) -> Option<&UserDB> {
+        self.user_info.get(user)
     }
 }
 
