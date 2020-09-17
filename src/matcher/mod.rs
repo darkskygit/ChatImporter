@@ -11,7 +11,7 @@ use regex::{Captures, Regex};
 
 use ios_sms::iOSSMSMsgMatcher;
 use ios_wechat::iOSWeChatMsgMatcher;
-pub use log::{error, info, warn};
+pub use log::{debug, error, info, warn};
 #[allow(unused_imports)]
 use windows_qq_html::{QQAttachGetter, QQMsgImage, QQMsgMatcher, QQPathAttachGetter};
 use windows_qq_mht::QQMhtMsgMatcher;

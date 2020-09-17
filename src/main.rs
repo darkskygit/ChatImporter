@@ -1,3 +1,5 @@
+#![feature(bool_to_option)]
+
 mod args;
 mod logger;
 mod matcher;

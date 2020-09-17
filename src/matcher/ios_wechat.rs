@@ -59,7 +59,7 @@ struct ChatLine {
     message: String,
     status: u8,
     image_status: u8,
-    msg_type: u8,
+    msg_type: u32,
     is_dest: bool,
 }
 
@@ -70,7 +70,8 @@ struct UserDB {
     setting: Option<BackupFile>,
     session: Option<Arc<NamedTempFile>>,
     account_files: HashMap<String, BackupFile>,
-    contacts: Vec<Contact>,
+    chats: HashMap<String, String>,
+    contacts: HashMap<String, Contact>,
     account: String,
     wxid: String,
     name: String,
@@ -104,6 +105,10 @@ impl UserDB {
         let filename = Path::new(&file.relative_filename).name_str().to_string();
         if ["WCDB_Contact.sqlite", "MM.sqlite", "session.db"].contains(&filename.as_str()) {
             if let Ok(tmpfile) = NamedTempFile::new().and_then(|mut tmpfile| {
+                debug!(
+                    "read file: {}, {}, {}",
+                    self.account, file.fileid, file.relative_filename
+                );
                 let data = backup
                     .read_file(file)
                     .map_err(|e| Error::new(ErrorKind::Other, format!("{}", e)))?;
@@ -145,10 +150,11 @@ impl UserDB {
     pub fn build(&mut self, backup: &Backup) -> Result<(), Box<dyn std::error::Error>> {
         self.load_settings(backup)?;
         self.load_contacts()?;
+        self.load_chats()?;
         Ok(())
     }
 
-    pub fn load_settings(&mut self, backup: &Backup) -> Result<(), Box<dyn std::error::Error>> {
+    fn load_settings(&mut self, backup: &Backup) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(setting) = &self.setting {
             let data = backup.read_file(setting)?;
             if let Some(array) = Value::from_reader(Cursor::new(data))?
@@ -203,17 +209,43 @@ impl UserDB {
         }
     }
 
-    pub fn load_contacts(&mut self) -> SqliteResult<()> {
+    fn load_chats(&mut self) -> SqliteResult<()> {
+        if let Some(conn) = Self::get_conn(self.message.clone())? {
+            let contact_keys = self.contacts.keys().map(|s| s.as_str()).collect::<Vec<_>>();
+            self.chats = conn
+                .prepare(r#"SELECT name FROM sqlite_master where type='table' and name like "Chat\_%" ESCAPE '\'"#)?
+                .query_map(params![], |row| {
+                    let name: String = row.get(0)?;
+                    let hash = &name[5..];
+                    if !contact_keys.iter().any(|&i| i == hash) && hash != self.account {
+                        warn!("Contact info for chat not exists: {}", hash);
+                    }
+                    Ok((hash.into(), name))
+                })?
+                .filter_map(|r| {
+                    r.map_err(|e| warn!("failed to parse chat list: {}", e))
+                        .ok()
+                })
+                .collect();
+        }
+        Ok(())
+    }
+
+    fn load_contacts(&mut self) -> SqliteResult<()> {
         if let Some(conn) = Self::get_conn(self.contact.clone())? {
             self.contacts = conn
                 .prepare("SELECT userName, dbContactRemark, dbContactHeadImage, type FROM Friend")?
                 .query_map(params![], |row| {
-                    Ok(Contact {
-                        name: row.get(0)?,
+                    let name = row.get(0)?;
+                    Ok((
+                        Self::gen_md5(&name),
+                        Contact {
+                            name,
                         remark: row.get(1)?,
                         head: row.get(2)?,
                         user_type: row.get(3)?,
-                    })
+                        },
+                    ))
                 })?
                 .filter_map(|r| r.map_err(|e| warn!("failed to parse contact: {}", e)).ok())
                 .collect();
@@ -227,17 +259,37 @@ impl UserDB {
 
     pub fn find_contacts<S: ToString>(&self, name: S) -> Vec<String> {
         let name = name.to_string();
+        let chat_keys = self.chats.keys().map(|s| s.as_str()).collect::<Vec<_>>();
         self.contacts
             .iter()
-            .filter(|c| {
-                if name.is_empty() {
-                    true
+            .filter_map(|(hash, c)| {
+                if chat_keys.iter().any(|&i| i == hash) {
+                    (name.is_empty()
+                        || hash == &name
+                        || c.name.find(&name).is_some()
+                        || c.get_remark().ok().and_then(|r| r.find(&name)).is_some())
+                    .then(|| {
+                        info!(
+                            "Chat table found: {}, {}, {}",
+                            hash,
+                            c.name,
+                            c.get_remark()
+                                .unwrap_or_else(|e| format!("No Remark: {}", e))
+                        );
+                        hash
+                    })
                 } else {
-                    c.name.find(&name).is_some()
-                        || c.get_remark().ok().and_then(|r| r.find(&name)).is_some()
+                    debug!(
+                        "Chat table not found: {}, {}, {}",
+                        hash,
+                        c.name,
+                        c.get_remark()
+                            .unwrap_or_else(|e| format!("No Remark: {}", e))
+                    );
+                    None
                 }
             })
-            .map(|c| c.name.clone())
+            .cloned()
             .collect()
     }
 
@@ -246,8 +298,9 @@ impl UserDB {
         format!("{:x}", Md5::digest(user_name.to_string().as_bytes()))
     }
 
-    pub fn load_chat<S: ToString>(&self, user_name: S) -> SqliteResult<Vec<ChatLine>> {
+    pub fn load_chat_lines<S: ToString>(&self, user_name: S) -> SqliteResult<Vec<ChatLine>> {
         if let Some(conn) = Self::get_conn(self.message.clone())? {
+            let user_name = user_name.to_string();
             Ok(conn
                 .prepare(&format!(
                     "SELECT
@@ -261,7 +314,11 @@ impl UserDB {
                         Des
                     FROM
                         Chat_{}",
-                    Self::gen_md5(user_name)
+                    self.chats
+                        .keys()
+                        .find(|h| h.as_str() == user_name)
+                        .map(|s| s.into())
+                        .unwrap_or_else(|| Self::gen_md5(user_name))
                 ))?
                 .query_map(params![], |row| {
                     Ok(ChatLine {
@@ -275,7 +332,10 @@ impl UserDB {
                         is_dest: row.get(7)?,
                     })
                 })?
-                .filter_map(|r| r.map_err(|e| warn!("failed to parse contact: {}", e)).ok())
+                .filter_map(|r| {
+                    r.map_err(|e| warn!("failed to parse chat line: {}", e))
+                        .ok()
+                })
                 .collect())
         } else {
             Ok(vec![])
