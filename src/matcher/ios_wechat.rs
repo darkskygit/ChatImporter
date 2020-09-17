@@ -253,11 +253,15 @@ impl UserDB {
         Ok(())
     }
 
-    pub fn get_contacts(&self) -> Vec<String> {
+    fn get_chat_ids(&self) -> Vec<String> {
+        self.chats.keys().cloned().collect::<Vec<_>>()
+    }
+
+    fn get_contacts(&self) -> Vec<String> {
         self.find_contacts("")
     }
 
-    pub fn find_contacts<S: ToString>(&self, name: S) -> Vec<String> {
+    fn find_contacts<S: ToString>(&self, name: S) -> Vec<String> {
         let name = name.to_string();
         let chat_keys = self.chats.keys().map(|s| s.as_str()).collect::<Vec<_>>();
         self.contacts
@@ -298,7 +302,7 @@ impl UserDB {
         format!("{:x}", Md5::digest(user_name.to_string().as_bytes()))
     }
 
-    pub fn load_chat_lines<S: ToString>(&self, user_name: S) -> SqliteResult<Vec<ChatLine>> {
+    fn load_chat_lines<S: ToString>(&self, user_name: S) -> SqliteResult<Vec<ChatLine>> {
         if let Some(conn) = Self::get_conn(self.message.clone())? {
             let user_name = user_name.to_string();
             Ok(conn
@@ -340,6 +344,33 @@ impl UserDB {
         } else {
             Ok(vec![])
         }
+    }
+
+    fn load_records<S: ToString>(&self, chat_id: S) -> Option<Vec<Record>> {
+        self.load_chat_lines(chat_id)
+            .map_err(|e| warn!("failed to get chat line: {}", e))
+            .ok()
+            .and_then(|_| todo!())
+}
+
+    pub fn get_records(&self, backup: &Backup, names: Option<Vec<String>>) -> Vec<Record> {
+        match names {
+            None => self.get_chat_ids(),
+            Some(names) if names.is_empty() => self.get_contacts(),
+            Some(names) => names,
+        }
+        .iter()
+        .flat_map(|name| {
+            self.find_contacts(name)
+                .iter()
+                .filter_map(|chat_id| {
+                    info!("Extracting: {} => {}", name, chat_id);
+                    self.load_records(chat_id)
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
     }
 }
 
@@ -422,26 +453,40 @@ impl iOSWeChatExtractor {
         self.user_info.keys().cloned().collect()
 }
 
-    pub fn get_user_db(&self, user: &str) -> Option<&UserDB> {
-        self.user_info.get(user)
+    pub fn get_user_db(&self, user: &str) -> Option<(&UserDB, &Backup)> {
+        self.user_info.get(user).map(|db| (db, &self.backup))
     }
 }
 
 #[allow(non_camel_case_types)]
 pub struct iOSWeChatMsgMatcher {
     extractor: iOSWeChatExtractor,
+    extract_ids: Vec<String>,
+    names: Option<Vec<String>>,
 }
 
 impl iOSWeChatMsgMatcher {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Box<dyn MsgMatcher>> {
+    pub fn new<P: AsRef<Path>>(path: P, names: Option<Vec<String>>) -> Result<Box<dyn MsgMatcher>> {
         let extractor = iOSWeChatExtractor::new(path).map_err(|e| anyhow::anyhow!("{}", e))?;
-        Ok(Box::new(Self { extractor }) as Box<dyn MsgMatcher>)
+        let extract_ids = extractor.get_users();
+        Ok(Box::new(Self {
+            extractor,
+            extract_ids,
+            names,
+        }) as Box<dyn MsgMatcher>)
     }
 }
 
 impl MsgMatcher for iOSWeChatMsgMatcher {
     fn get_records(&self) -> Option<Vec<RecordType>> {
-        todo!()
+        Some(
+            self.extract_ids
+                .iter()
+                .filter_map(|u| self.extractor.get_user_db(u))
+                .flat_map(|(user_db, backup)| user_db.get_records(backup, self.names.clone()))
+                .map(RecordType::from)
+                .collect(),
+        )
     }
 }
 

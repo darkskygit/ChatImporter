@@ -6,12 +6,12 @@ mod windows_qq_mht;
 use gchdb::{Blob, Record, RecordType};
 use htmlescape::decode_html;
 use lazy_static::lazy_static;
+pub use log::{debug, error, info, warn};
 use path_ext::PathExt;
 use regex::{Captures, Regex};
 
 use ios_sms::iOSSMSMsgMatcher;
 use ios_wechat::iOSWeChatMsgMatcher;
-pub use log::{debug, error, info, warn};
 #[allow(unused_imports)]
 use windows_qq_html::{QQAttachGetter, QQMsgImage, QQMsgMatcher, QQPathAttachGetter};
 use windows_qq_mht::QQMhtMsgMatcher;
@@ -29,7 +29,7 @@ use std::time::Instant;
 #[allow(non_camel_case_types)]
 pub enum ExportType<P: AsRef<Path>> {
     WindowsQQ(P, String),
-    iOSWeChat(P),
+    iOSWeChat(P, Option<Vec<String>>),
     iOSSMS(P, String),
 }
 
@@ -47,7 +47,7 @@ where
                 .unwrap_or_default()
                 .into(),
         )?,
-        ExportType::iOSWeChat(path) => iOSWeChatMsgMatcher::new(path)?,
+        ExportType::iOSWeChat(path, names) => iOSWeChatMsgMatcher::new(path, names)?,
         ExportType::iOSSMS(path, owner) => iOSSMSMsgMatcher::new(path, owner)?,
     };
     let records = matcher.get_records().context("Cannot transfrom records")?;

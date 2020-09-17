@@ -5,7 +5,7 @@ mod logger;
 mod matcher;
 
 use anyhow::Result;
-use args::{get_cmd, get_owner, get_paths, SubCommand};
+use args::{get_cmd, get_paths, SubCommand};
 use gchdb::SqliteChatRecorder;
 use logger::init_logger;
 use matcher::{exporter, info, ExportType};
@@ -18,9 +18,11 @@ fn main() -> Result<()> {
         exporter(
             &mut recorder,
             match get_cmd() {
-                SubCommand::QQ { .. } => ExportType::WindowsQQ(path, get_owner()),
-                SubCommand::WeChat { .. } => ExportType::iOSWeChat(path),
-                SubCommand::SMS { .. } => ExportType::iOSSMS(path, get_owner()),
+                SubCommand::QQ { owner, .. } => ExportType::WindowsQQ(path, owner.into()),
+                SubCommand::WeChat { chat_names, .. } => {
+                    ExportType::iOSWeChat(path, chat_names.clone())
+                }
+                SubCommand::SMS { owner, .. } => ExportType::iOSSMS(path, owner.into()),
             },
         )?;
     }

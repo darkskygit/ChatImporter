@@ -17,6 +17,8 @@ pub enum SubCommand {
     },
     #[structopt(name = "wc", about = "import wechat from ios backup")]
     WeChat {
+        #[structopt(short = "c")]
+        chat_names: Option<Vec<String>>,
         #[structopt(name = "DIR", parse(try_from_str = check_path))]
         path: Vec<PathBuf>,
     },
@@ -47,7 +49,7 @@ impl Args {
                 })
                 .filter(|p| p.is_file())
                 .collect(),
-            SubCommand::WeChat { path } | SubCommand::SMS { path, .. } => path
+            SubCommand::WeChat { path, .. } | SubCommand::SMS { path, .. } => path
                 .iter()
                 .map(PathBuf::from)
                 .filter(PathBuf::is_dir)
@@ -83,10 +85,6 @@ lazy_static! {
 
 pub fn get_paths() -> Vec<PathBuf> {
     ARGS.get_paths()
-}
-
-pub fn get_owner() -> String {
-    ARGS.get_owner()
 }
 
 pub fn get_cmd() -> &'static SubCommand {
