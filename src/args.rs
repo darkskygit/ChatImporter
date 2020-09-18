@@ -56,14 +56,6 @@ impl Args {
                 .collect(),
         }
     }
-
-    fn get_owner(&self) -> String {
-        match &self.cmd {
-            SubCommand::QQ { owner, .. } => owner.clone(),
-            SubCommand::SMS { owner, .. } => owner.clone(),
-            _ => "".into(),
-        }
-    }
 }
 
 fn check_path<S: AsRef<str>>(src: S) -> Result<PathBuf, Error> {

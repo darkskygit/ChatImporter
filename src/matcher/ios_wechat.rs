@@ -347,10 +347,17 @@ impl UserDB {
     }
 
     fn load_records<S: ToString>(&self, chat_id: S) -> Option<Vec<Record>> {
-        self.load_chat_lines(chat_id)
+        let chat_id = chat_id.to_string();
+        let contact = self.contacts.get(&chat_id);
+        self.load_chat_lines(&chat_id)
             .map_err(|e| warn!("failed to get chat line: {}", e))
             .ok()
-            .and_then(|_| todo!())
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| line.get_record(&chat_id, contact.clone()))
+                    .collect()
+            })
 }
 
     pub fn get_records(&self, backup: &Backup, names: Option<Vec<String>>) -> Vec<Record> {

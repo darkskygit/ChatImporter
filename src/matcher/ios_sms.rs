@@ -6,7 +6,7 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 
 #[derive(Debug)]
-struct SMSRecord {
+struct RecordLine {
     id: i32,
     target: String,
     text: String,
@@ -19,12 +19,12 @@ struct SMSRecord {
 }
 
 #[allow(non_camel_case_types)]
-struct iOSSMSMatcher {
+struct Extractor {
     conn: Connection,
     owner: String,
 }
 
-impl iOSSMSMatcher {
+impl Extractor {
     pub fn new<P: AsRef<Path>>(path: P, owner: String) -> SqliteResult<Self> {
         Ok(Self {
             conn: Connection::open_with_flags(
@@ -56,7 +56,7 @@ impl iOSSMSMatcher {
             == Some(1))
     }
 
-    fn get_sms_records(&self, chat_id: i32) -> SqliteResult<Vec<Record>> {
+    fn get_record_lines(&self, chat_id: i32) -> SqliteResult<Vec<Record>> {
         let base_date_offset = Utc.timestamp(978307200, 0);
         let has_is_spam = self.check_has_is_spam()?;
         let mut stmt = self.conn.prepare(&format!(
@@ -80,7 +80,7 @@ impl iOSSMSMatcher {
             if has_is_spam { "message.is_spam" } else { "0" }
         ))?;
         let records_iter = stmt.query_map(params![chat_id], |row| {
-            Ok(SMSRecord {
+            Ok(RecordLine {
                 id: row.get(0)?,
                 target: row.get(1)?,
                 text: row.get(2)?,
@@ -118,13 +118,13 @@ impl iOSSMSMatcher {
     }
 }
 
-impl MsgMatcher for iOSSMSMatcher {
+impl MsgMatcher for Extractor {
     fn get_records(&self) -> Option<Vec<RecordType>> {
         self.get_chat_ids()
             .map(|ids| {
                 ids.iter()
                     .filter_map(|id| {
-                        self.get_sms_records(*id)
+                        self.get_record_lines(*id)
                             .map_err(|e| warn!("Failed to get sms record {}: {}", id, e))
                             .ok()
                     })
@@ -138,12 +138,12 @@ impl MsgMatcher for iOSSMSMatcher {
 }
 
 #[allow(non_camel_case_types)]
-pub struct iOSSMSMsgMatcher {
+pub struct Matcher {
     _smsdb: NamedTempFile,
-    matcher: iOSSMSMatcher,
+    extractor: Extractor,
 }
 
-impl iOSSMSMsgMatcher {
+impl Matcher {
     pub fn new<P: AsRef<Path>>(path: P, owner: String) -> Result<Box<dyn MsgMatcher>> {
         let backup = Self::init_backup(path).map_err(|e| anyhow::anyhow!("{}", e))?;
         if let Some(sms) = backup.find_path("HomeDomain", "Library/SMS/sms.db") {
@@ -154,7 +154,7 @@ impl iOSSMSMsgMatcher {
                     .map_err(|e| anyhow::anyhow!("{}", e))?,
             )?;
             Ok(Box::new(Self {
-                matcher: iOSSMSMatcher::new(tempfile.path(), owner)?,
+                extractor: Extractor::new(tempfile.path(), owner)?,
                 _smsdb: tempfile,
             }) as Box<dyn MsgMatcher>)
         } else {
@@ -169,15 +169,15 @@ impl iOSSMSMsgMatcher {
     }
 }
 
-impl MsgMatcher for iOSSMSMsgMatcher {
+impl MsgMatcher for Matcher {
     fn get_records(&self) -> Option<Vec<RecordType>> {
-        self.matcher.get_records()
+        self.extractor.get_records()
     }
 }
 
 #[test]
 fn test_ios_sms_db() -> SqliteResult<()> {
-    let matcher = iOSSMSMatcher::new("sms.db", "".into())?;
+    let matcher = Extractor::new("sms.db", "".into())?;
     println!(
         "{}",
         matcher
@@ -187,7 +187,7 @@ fn test_ios_sms_db() -> SqliteResult<()> {
             .collect::<Vec<_>>()
             .join(",")
     );
-    for recoder in matcher.get_sms_records(0)? {
+    for recoder in matcher.get_record_lines(0)? {
         println!("{:?}", recoder);
     }
     Ok(())

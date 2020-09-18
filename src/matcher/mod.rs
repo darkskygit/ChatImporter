@@ -10,12 +10,6 @@ pub use log::{debug, error, info, warn};
 use path_ext::PathExt;
 use regex::{Captures, Regex};
 
-use ios_sms::iOSSMSMsgMatcher;
-use ios_wechat::iOSWeChatMsgMatcher;
-#[allow(unused_imports)]
-use windows_qq_html::{QQAttachGetter, QQMsgImage, QQMsgMatcher, QQPathAttachGetter};
-use windows_qq_mht::QQMhtMsgMatcher;
-
 pub trait MsgMatcher {
     fn get_records(&self) -> Option<Vec<RecordType>>;
 }
@@ -38,7 +32,7 @@ where
     P: AsRef<Path>,
 {
     let matcher = match export_type {
-        ExportType::WindowsQQ(path, owner) => QQMhtMsgMatcher::new(
+        ExportType::WindowsQQ(path, owner) => windows_qq_mht::Matcher::new(
             &read(&path)?,
             owner,
             path.as_ref()
@@ -47,8 +41,8 @@ where
                 .unwrap_or_default()
                 .into(),
         )?,
-        ExportType::iOSWeChat(path, names) => iOSWeChatMsgMatcher::new(path, names)?,
-        ExportType::iOSSMS(path, owner) => iOSSMSMsgMatcher::new(path, owner)?,
+        ExportType::iOSWeChat(path, names) => ios_wechat::Matcher::new(path, names)?,
+        ExportType::iOSSMS(path, owner) => ios_sms::Matcher::new(path, owner)?,
     };
     let records = matcher.get_records().context("Cannot transfrom records")?;
     let mut progress = 0.0;

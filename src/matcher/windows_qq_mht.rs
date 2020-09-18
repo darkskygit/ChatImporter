@@ -2,12 +2,13 @@ use super::*;
 use mailparse::{parse_mail, MailParseError};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use windows_qq_html::{Extractor, QQAttachGetter, QQMsgImage};
 
-pub struct QQMhtMsgMatcher {
-    qq_html_matcher: QQMsgMatcher,
+pub struct Matcher {
+    qq_html_matcher: Extractor,
 }
 
-impl QQMhtMsgMatcher {
+impl Matcher {
     pub fn new(
         data: &[u8],
         owner: String,
@@ -33,36 +34,29 @@ impl QQMhtMsgMatcher {
         attachs
             .get("__main__")
             .and_then(|data| String::from_utf8(data.clone()).ok())
-            .map(|html| {
-                QQMsgMatcher::new(
-                    html,
-                    owner,
-                    file_name,
-                    QQMhtAttachGetter::new(attachs.clone()),
-                )
-            })
+            .map(|html| Extractor::new(html, owner, file_name, AttachGetter::new(attachs.clone())))
             .map(|qq_html_matcher| Box::new(Self { qq_html_matcher }) as Box<dyn MsgMatcher>)
             .ok_or(MailParseError::Generic("test"))
     }
 }
 
-impl MsgMatcher for QQMhtMsgMatcher {
+impl MsgMatcher for Matcher {
     fn get_records(&self) -> Option<Vec<RecordType>> {
         self.qq_html_matcher.get_records()
     }
 }
 
-struct QQMhtAttachGetter {
+struct AttachGetter {
     attachs: HashMap<String, Vec<u8>>,
 }
 
-impl QQMhtAttachGetter {
+impl AttachGetter {
     pub fn new(attachs: HashMap<String, Vec<u8>>) -> Self {
         Self { attachs }
     }
 }
 
-impl QQAttachGetter for QQMhtAttachGetter {
+impl QQAttachGetter for AttachGetter {
     fn get_attach(&self, path: &str) -> QQMsgImage {
         let name = PathBuf::from(path)
             .file_name()

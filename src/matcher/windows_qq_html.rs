@@ -47,14 +47,14 @@ pub struct QQPathAttachGetter;
 
 impl QQAttachGetter for QQPathAttachGetter {}
 
-pub struct QQMsgMatcher {
+pub struct Extractor {
     html: Html,
     owner: String,
     file_name: String,
     attach_getter: Box<dyn QQAttachGetter>,
 }
 
-impl QQMsgMatcher {
+impl Extractor {
     pub fn new<A>(html: String, owner: String, file_name: String, attach_getter: A) -> Self
     where
         A: 'static + QQAttachGetter,
@@ -377,7 +377,7 @@ impl QQMsgMatcher {
     }
 }
 
-impl MsgMatcher for QQMsgMatcher {
+impl MsgMatcher for Extractor {
     fn get_records(&self) -> Option<Vec<RecordType>> {
         self.get_table().and_then(|table| {
             Self::get_group_id(table.iter().take(4).collect::<Vec<_>>()).map(|(is_pm, group_id)| {
