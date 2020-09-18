@@ -1,9 +1,13 @@
 use super::*;
 use binread::*;
 use ibackuptool2::{Backup, BackupFile};
+use num_enum::TryFromPrimitive;
 use plist::Value;
 use rusqlite::{params, Connection, OpenFlags, Result as SqliteResult};
+use serde::Serialize;
+use serde_json::to_vec;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::io::{Cursor, Error, ErrorKind, Write};
 use std::str::{from_utf8, Utf8Error};
 use std::sync::Arc;
@@ -39,6 +43,7 @@ impl Contact {
             .into())
     }
 
+    #[allow(dead_code)]
     pub fn get_image(&self) -> Result<Option<String>, Utf8Error> {
         lazy_static! {
             static ref URL_MATCHER: Regex =
@@ -51,16 +56,96 @@ impl Contact {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, TryFromPrimitive)]
+#[repr(u32)]
+enum MsgType {
+    Normal = 1,        // 文字/emoji
+    Image = 3,         // 图片
+    Voice = 34,        // 语音
+    ContactShare = 42, // 联系人分享
+    Video = 43,        // 视频
+    BigEmoji = 47,     // 大表情
+    Location = 48,     // 定位
+    CustomApp = 49,    // 文件、分享、转账、聊天记录批量转发
+    VoipContent = 50,  // 语音/视频通话？
+    ShortVideo = 62,   // 短视频？
+    System = 10000,    // 系统信息，入群/群改名/他人撤回信息/红包领取提醒等等
+    Revoke = 10002,    // 撤回信息修改
+    Unknown = u32::MAX,
+}
+
+impl Default for MsgType {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Default, Serialize)]
+struct AttachMetadata {
+    mtype: MsgType,
+    hash: i64,
+}
+
+impl AttachMetadata {
+    pub fn new(hash: i64) -> Self {
+        Self {
+            hash,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_type(mut self, mtype: MsgType) -> Self {
+        self.mtype = mtype;
+        self
+    }
+}
+
 #[derive(Clone, Debug)]
-struct ChatLine {
+struct RecordLine {
     local_id: i64,
     server_id: i64,
     created_time: i64,
     message: String,
     status: u8,
     image_status: u8,
-    msg_type: u32,
+    msg_type: MsgType,
     is_dest: bool,
+}
+
+impl RecordLine {
+    pub fn get_audio(
+        &self,
+        backup: &Backup,
+        backups: &HashMap<String, BackupFile>,
+        account: &str,
+        hashed_user: &str,
+    ) -> Option<(AttachMetadata, Vec<u8>)> {
+        let path = format!(
+            "Documents/{}/Audio/{}/{}.aud",
+            account, hashed_user, self.local_id
+        );
+        backups
+            .get(&path)
+            .or_else(|| {
+                warn!(
+                    "audio not found: {}, {}, {}",
+                    account, hashed_user, self.local_id
+                );
+                None
+            })
+            .and_then(|file| {
+                backup
+                    .read_file(file)
+                    .map_err(|e| {
+                        warn!(
+                            "failed to read audio: {}, {}, {}, {}",
+                            account, hashed_user, self.local_id, e
+                        )
+                    })
+                    .ok()
+            })
+            .map(|data| (AttachMetadata::new(Blob::new(data.clone()).hash), data))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -241,9 +326,9 @@ impl UserDB {
                         Self::gen_md5(&name),
                         Contact {
                             name,
-                        remark: row.get(1)?,
-                        head: row.get(2)?,
-                        user_type: row.get(3)?,
+                            remark: row.get(1)?,
+                            head: row.get(2)?,
+                            user_type: row.get(3)?,
                         },
                     ))
                 })?
@@ -302,7 +387,7 @@ impl UserDB {
         format!("{:x}", Md5::digest(user_name.to_string().as_bytes()))
     }
 
-    fn load_chat_lines<S: ToString>(&self, user_name: S) -> SqliteResult<Vec<ChatLine>> {
+    fn load_record_lines<S: ToString>(&self, user_name: S) -> SqliteResult<Vec<RecordLine>> {
         if let Some(conn) = Self::get_conn(self.message.clone())? {
             let user_name = user_name.to_string();
             Ok(conn
@@ -325,14 +410,17 @@ impl UserDB {
                         .unwrap_or_else(|| Self::gen_md5(user_name))
                 ))?
                 .query_map(params![], |row| {
-                    Ok(ChatLine {
+                    Ok(RecordLine {
                         local_id: row.get(0)?,
                         server_id: row.get(1)?,
                         created_time: row.get(2)?,
                         message: row.get(3)?,
                         status: row.get(4)?,
                         image_status: row.get(5)?,
-                        msg_type: row.get(6)?,
+                        msg_type: MsgType::try_from(row.get::<_, u32>(6)?).unwrap_or_else(|t| {
+                            warn!("unknown type: {}", t);
+                            MsgType::Unknown
+                        }),
                         is_dest: row.get(7)?,
                     })
                 })?
@@ -346,21 +434,156 @@ impl UserDB {
         }
     }
 
-    fn load_records<S: ToString>(&self, chat_id: S) -> Option<Vec<Record>> {
-        let chat_id = chat_id.to_string();
-        let contact = self.contacts.get(&chat_id);
-        self.load_chat_lines(&chat_id)
-            .map_err(|e| warn!("failed to get chat line: {}", e))
-            .ok()
-            .map(|lines| {
-                lines
-                    .iter()
-                    .filter_map(|line| line.get_record(&chat_id, contact.clone()))
-                    .collect()
-            })
-}
+    fn transfrom_record_line(
+        &self,
+        backup: &Backup,
+        line: &RecordLine,
+        contact: &Contact,
+    ) -> Result<RecordType, String> {
+        let is_group = contact.name.ends_with("@chatroom");
+        let (sender_id, sender_name, content) = {
+            if line.is_dest {
+                if is_group {
+                    if let Some(idx) = line.message.find('\n') {
+                        let id = &line.message[0..idx - 1];
+                        if let Some((id, remark)) = self
+                            .contacts
+                            .get(&Self::gen_md5(id))
+                            .and_then(|c| c.get_remark().map(|r| (c.name.clone(), r)).ok())
+                        {
+                            (id, remark, line.message[idx + 1..].into())
+                        } else {
+                            debug!("wxid {} not found in contacts", id);
+                            (id.into(), "".into(), line.message[idx + 1..].into())
+                        }
+                    } else if [
+                        MsgType::BigEmoji,
+                        MsgType::CustomApp,
+                        MsgType::Video,
+                        MsgType::System,
+                        MsgType::Revoke,
+                    ]
+                    .contains(&line.msg_type)
+                    {
+                        (
+                            contact.name.clone(),
+                            contact.get_remark().unwrap_or_default(),
+                            line.message.clone(),
+                        )
+                    } else {
+                        return Err(format!(
+                            "new line not exists in a group line: {}, {}, {:?}",
+                            line.local_id, line.created_time, line.msg_type
+                        ));
+                    }
+                } else {
+                    (
+                        contact.name.clone(),
+                        contact.get_remark().unwrap_or_default(),
+                        line.message.clone(),
+                    )
+                }
+            } else {
+                (self.wxid.clone(), self.name.clone(), line.message.clone())
+            }
+        };
 
-    pub fn get_records(&self, backup: &Backup, names: Option<Vec<String>>) -> Vec<Record> {
+        let (content, metadata, attach) = match line.msg_type {
+            MsgType::Voice => {
+                if let Some((metadata, data)) = line.get_audio(
+                    backup,
+                    &self.account_files,
+                    &self.account,
+                    &Self::gen_md5(&contact.name),
+                ) {
+                    (
+                        content,
+                        Some(metadata.clone().with_type(line.msg_type.clone())),
+                        {
+                            let mut map = HashMap::new();
+                            map.insert(metadata.hash.to_string(), data);
+                            map
+                        },
+                    )
+                } else {
+                    (content, None, HashMap::new())
+                }
+            }
+            _ => (content, None, HashMap::new()),
+        };
+
+        let record = Record {
+            chat_type: "iOS WeChat".into(),
+            owner_id: self.wxid.clone(),
+            group_id: contact.name.clone(),
+            sender_id,
+            sender_name,
+            content,
+            timestamp: line.created_time * 1000,
+            metadata: metadata.as_ref().and_then(|m| {
+                to_vec(m)
+                    .map_err(|e| warn!("failed to serialization metadata: {}", e))
+                    .ok()
+            }),
+            ..Default::default()
+        };
+
+        Ok(if metadata.is_some() {
+            RecordType::from((record, attach))
+        } else {
+            RecordType::from(record)
+        })
+    }
+
+    fn transfrom_record_lines(
+        &self,
+        backup: &Backup,
+        contact: &Contact,
+        lines: Vec<RecordLine>,
+    ) -> Vec<RecordType> {
+        lines
+            .iter()
+            .fold(Vec::<RecordType>::new(), |mut ret, curr| {
+                match self.transfrom_record_line(backup, curr, contact) {
+                    Ok(record_type) => record_type
+                        .get_record()
+                        .and_then(|record| {
+                            modify_timestamp(
+                                record_type.clone(),
+                                ret.iter()
+                                    .filter_map(|r| r.get_record())
+                                    .filter(|r| {
+                                        i64::abs(r.timestamp - record.timestamp) < 1000
+                                            && r.sender_id == record.sender_id
+                                    })
+                                    .map(|r| r.timestamp)
+                                    .max(),
+                            )
+                        })
+                        .map(|record| ret.push(record)),
+                    Err(e) => Some(error!("failed to transfrom record line: {}", e)),
+                };
+                ret
+            })
+    }
+
+    fn load_records<S: ToString>(&self, backup: &Backup, chat_id: S) -> Option<Vec<RecordType>> {
+        let chat_id = chat_id.to_string();
+        self.contacts
+            .get(&chat_id)
+            .or_else(|| {
+                warn!("failed to get chat contact: {}", chat_id);
+                None
+            })
+            .and_then(|contact| {
+                self.load_record_lines(&chat_id)
+                    .map(|lines| self.transfrom_record_lines(backup, contact, lines))
+                    .map_err(|e| warn!("failed to get chat line: {}", e))
+                    .ok()
+            })
+    }
+
+    pub fn get_records(&self, backup: &Backup, names: Option<Vec<String>>) -> Vec<RecordType> {
         match names {
             None => self.get_chat_ids(),
             Some(names) if names.is_empty() => self.get_contacts(),
@@ -372,7 +595,7 @@ impl UserDB {
                 .iter()
                 .filter_map(|chat_id| {
                     info!("Extracting: {} => {}", name, chat_id);
-                    self.load_records(chat_id)
+                    self.load_records(backup, chat_id)
                 })
                 .flatten()
                 .collect::<Vec<_>>()
@@ -382,12 +605,12 @@ impl UserDB {
 }
 
 #[allow(non_camel_case_types)]
-struct iOSWeChatExtractor {
+struct Extractor {
     backup: Backup,
     user_info: HashMap<String, UserDB>,
 }
 
-impl iOSWeChatExtractor {
+impl Extractor {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let mut backup = Backup::new(path)?;
         backup.parse_manifest()?;
@@ -458,7 +681,7 @@ impl iOSWeChatExtractor {
 
     pub fn get_users(&self) -> Vec<String> {
         self.user_info.keys().cloned().collect()
-}
+    }
 
     pub fn get_user_db(&self, user: &str) -> Option<(&UserDB, &Backup)> {
         self.user_info.get(user).map(|db| (db, &self.backup))
@@ -466,15 +689,15 @@ impl iOSWeChatExtractor {
 }
 
 #[allow(non_camel_case_types)]
-pub struct iOSWeChatMsgMatcher {
-    extractor: iOSWeChatExtractor,
+pub struct Matcher {
+    extractor: Extractor,
     extract_ids: Vec<String>,
     names: Option<Vec<String>>,
 }
 
-impl iOSWeChatMsgMatcher {
+impl Matcher {
     pub fn new<P: AsRef<Path>>(path: P, names: Option<Vec<String>>) -> Result<Box<dyn MsgMatcher>> {
-        let extractor = iOSWeChatExtractor::new(path).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let extractor = Extractor::new(path).map_err(|e| anyhow::anyhow!("{}", e))?;
         let extract_ids = extractor.get_users();
         Ok(Box::new(Self {
             extractor,
@@ -484,16 +707,14 @@ impl iOSWeChatMsgMatcher {
     }
 }
 
-impl MsgMatcher for iOSWeChatMsgMatcher {
+impl MsgMatcher for Matcher {
     fn get_records(&self) -> Option<Vec<RecordType>> {
         Some(
             self.extract_ids
                 .iter()
                 .filter_map(|u| self.extractor.get_user_db(u))
                 .flat_map(|(user_db, backup)| user_db.get_records(backup, self.names.clone()))
-                .map(RecordType::from)
                 .collect(),
         )
     }
 }
-

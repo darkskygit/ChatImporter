@@ -70,3 +70,36 @@ where
     recorder.refresh_index()?;
     Ok(())
 }
+
+fn modify_timestamp(record_type: RecordType, near_sec: Option<i64>) -> Option<RecordType> {
+    use std::cmp::max;
+    if let Some(near_sec) = near_sec {
+        match record_type {
+            RecordType::Record(record) => Some(RecordType::from(Record {
+                timestamp: max(near_sec, record.timestamp) + 1,
+                ..record
+            })),
+            RecordType::RecordRef(record) => Some(RecordType::from(Record {
+                timestamp: max(near_sec, record.timestamp) + 1,
+                ..record.clone()
+            })),
+            RecordType::RecordWithAttachs { record, attachs } => Some(RecordType::from((
+                Record {
+                    timestamp: max(near_sec, record.timestamp) + 1,
+                    ..record
+                },
+                attachs,
+            ))),
+            RecordType::RecordRefWithAttachs { record, attachs } => Some(RecordType::from((
+                Record {
+                    timestamp: max(near_sec, record.timestamp) + 1,
+                    ..record.clone()
+                },
+                attachs,
+            ))),
+            _ => None,
+        }
+    } else {
+        Some(record_type)
+    }
+}

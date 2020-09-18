@@ -18,7 +18,7 @@ pub enum SubCommand {
     #[structopt(name = "wc", about = "import wechat from ios backup")]
     WeChat {
         #[structopt(short = "c")]
-        chat_names: Option<Vec<String>>,
+        chat_names: String,
         #[structopt(name = "DIR", parse(try_from_str = check_path))]
         path: Vec<PathBuf>,
     },

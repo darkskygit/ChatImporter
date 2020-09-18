@@ -3,7 +3,6 @@ use chrono::{NaiveDate, NaiveTime};
 use scraper::{ElementRef, Html, Node, Selector};
 use serde::Serialize;
 use serde_json::to_vec;
-use std::cmp::max;
 use std::path::PathBuf;
 
 #[derive(Clone, Serialize)]
@@ -343,38 +342,6 @@ impl Extractor {
             }
         })
     }
-
-    fn modify_timestamp(record_type: RecordType, near_sec: Option<i64>) -> Option<RecordType> {
-        if let Some(near_sec) = near_sec {
-            match record_type {
-                RecordType::Record(record) => Some(RecordType::from(Record {
-                    timestamp: max(near_sec, record.timestamp) + 1,
-                    ..record
-                })),
-                RecordType::RecordRef(record) => Some(RecordType::from(Record {
-                    timestamp: max(near_sec, record.timestamp) + 1,
-                    ..record.clone()
-                })),
-                RecordType::RecordWithAttachs { record, attachs } => Some(RecordType::from((
-                    Record {
-                        timestamp: max(near_sec, record.timestamp) + 1,
-                        ..record
-                    },
-                    attachs,
-                ))),
-                RecordType::RecordRefWithAttachs { record, attachs } => Some(RecordType::from((
-                    Record {
-                        timestamp: max(near_sec, record.timestamp) + 1,
-                        ..record.clone()
-                    },
-                    attachs,
-                ))),
-                _ => None,
-            }
-        } else {
-            Some(record_type)
-        }
-    }
 }
 
 impl MsgMatcher for Extractor {
@@ -403,7 +370,7 @@ impl MsgMatcher for Extractor {
                                         record_type
                                             .get_record()
                                             .and_then(|record| {
-                                                Self::modify_timestamp(
+                                                modify_timestamp(
                                                     record_type.clone(),
                                                     ret.iter()
                                                         .filter_map(|r| r.get_record())
