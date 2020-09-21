@@ -9,6 +9,7 @@ use serde_json::to_vec;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Error, ErrorKind, Write};
+use std::iter::IntoIterator;
 use std::str::{from_utf8, Utf8Error};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
@@ -83,15 +84,20 @@ impl Default for MsgType {
 #[derive(Clone, Default, Serialize)]
 struct AttachMetadata {
     mtype: MsgType,
-    hash: i64,
+    hash: HashMap<String, i64>,
 }
 
 impl AttachMetadata {
-    pub fn new(hash: i64) -> Self {
+    pub fn new() -> Self {
         Self {
-            hash,
+            hash: HashMap::new(),
             ..Default::default()
         }
+    }
+
+    pub fn with_hash(mut self, name: String, hash: i64) -> Self {
+        self.hash.insert(name, hash);
+        self
     }
 
     pub fn with_type(mut self, mtype: MsgType) -> Self {
@@ -119,17 +125,105 @@ impl RecordLine {
         backups: &HashMap<String, BackupFile>,
         account: &str,
         hashed_user: &str,
+    ) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)> {
+        let (ftype, dir, ext) = ("voice", "Audio", "aud");
+        Self::get_files(vec![self
+            .get_file(backup, backups, account, hashed_user, ftype, dir, ext)
+            .map(|(metadata, data)| (ftype.into(), metadata, data))])
+    }
+
+    pub fn get_image(
+        &self,
+        backup: &Backup,
+        backups: &HashMap<String, BackupFile>,
+        account: &str,
+        hashed_user: &str,
+    ) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)> {
+        Self::get_files(vec![
+            self.get_image_thum(backup, backups, account, hashed_user),
+            self.get_image_small(backup, backups, account, hashed_user),
+            self.get_image_hd(backup, backups, account, hashed_user),
+        ])
+    }
+
+    fn get_image_small(
+        &self,
+        backup: &Backup,
+        backups: &HashMap<String, BackupFile>,
+        account: &str,
+        hashed_user: &str,
+    ) -> Option<(String, AttachMetadata, Vec<u8>)> {
+        let (ftype, dir, ext) = ("img", "Img", "pic");
+        self.get_file(backup, backups, account, hashed_user, ftype, dir, ext)
+            .map(|(metadata, data)| (ftype.into(), metadata, data))
+    }
+
+    fn get_image_hd(
+        &self,
+        backup: &Backup,
+        backups: &HashMap<String, BackupFile>,
+        account: &str,
+        hashed_user: &str,
+    ) -> Option<(String, AttachMetadata, Vec<u8>)> {
+        let (ftype, dir, ext) = ("hd", "Img", "pic_hd");
+        self.get_file(backup, backups, account, hashed_user, ftype, dir, ext)
+            .map(|(metadata, data)| (ftype.into(), metadata, data))
+    }
+
+    fn get_image_thum(
+        &self,
+        backup: &Backup,
+        backups: &HashMap<String, BackupFile>,
+        account: &str,
+        hashed_user: &str,
+    ) -> Option<(String, AttachMetadata, Vec<u8>)> {
+        let (ftype, dir, ext) = ("thum", "Img", "pic_thum");
+        self.get_file(backup, backups, account, hashed_user, ftype, dir, ext)
+            .map(|(metadata, data)| (ftype.into(), metadata, data))
+    }
+
+    fn get_files<I>(iter: I) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)>
+    where
+        I: IntoIterator<Item = Option<(String, AttachMetadata, Vec<u8>)>>,
+    {
+        let (metadata, map) = iter
+            .into_iter()
+            .filter_map(|i| i.clone())
+            .filter_map(|(ftype, metadata, data)| {
+                metadata
+                    .hash
+                    .get(&ftype)
+                    .map(|hash| (ftype, hash.clone(), data))
+            })
+            .fold(
+                (AttachMetadata::new(), HashMap::new()),
+                |(metadata, mut map), (ftype, hash, data)| {
+                    map.insert(hash.to_string(), data.clone());
+                    (metadata.with_hash(ftype, hash), map)
+                },
+            );
+        (!map.is_empty() && !metadata.hash.is_empty()).then_some((metadata, map))
+    }
+
+    fn get_file(
+        &self,
+        backup: &Backup,
+        backups: &HashMap<String, BackupFile>,
+        account: &str,
+        hashed_user: &str,
+        file_type: &str,
+        folder: &str,
+        ext: &str,
     ) -> Option<(AttachMetadata, Vec<u8>)> {
-        let path = format!(
-            "Documents/{}/Audio/{}/{}.aud",
-            account, hashed_user, self.local_id
-        );
         backups
-            .get(&path)
+            .get(&format!(
+                "Documents/{}/{}/{}/{}.{}",
+                account, folder, hashed_user, self.local_id, ext
+            ))
             .or_else(|| {
                 warn!(
-                    "audio not found: {}, {}, {}",
-                    account, hashed_user, self.local_id
+                    "{} not found: {}, {}, {}",
+                    file_type, account, hashed_user, self.local_id
                 );
                 None
             })
@@ -138,13 +232,18 @@ impl RecordLine {
                     .read_file(file)
                     .map_err(|e| {
                         warn!(
-                            "failed to read audio: {}, {}, {}, {}",
-                            account, hashed_user, self.local_id, e
+                            "failed to read {}: {}, {}, {}, {}",
+                            file_type, account, hashed_user, self.local_id, e
                         )
                     })
                     .ok()
             })
-            .map(|data| (AttachMetadata::new(Blob::new(data.clone()).hash), data))
+            .map(|data| {
+                (
+                    AttachMetadata::new().with_hash(file_type.into(), Blob::new(data.clone()).hash),
+                    data,
+                )
+            })
     }
 }
 
@@ -489,31 +588,45 @@ impl UserDB {
         };
 
         let (content, metadata, attach) = match line.msg_type {
-            MsgType::Voice => {
-                if let Some((metadata, data)) = line.get_audio(
+            MsgType::Normal => Some((
+                content.replace("\u{2028}", " ").replace("\u{2029}", " "),
+                None,
+                HashMap::new(),
+            )),
+            MsgType::Image => line
+                .get_image(
                     backup,
                     &self.account_files,
                     &self.account,
                     &Self::gen_md5(&contact.name),
-                ) {
+                )
+                .map(|(metadata, map)| {
                     (
-                        content,
-                        Some(metadata.clone().with_type(line.msg_type.clone())),
-                        {
-                            let mut map = HashMap::new();
-                            map.insert(metadata.hash.to_string(), data);
-                            map
-                        },
+                        "[img]".into(),
+                        Some(metadata.with_type(line.msg_type.clone())),
+                        map,
                     )
-                } else {
-                    (content, None, HashMap::new())
-                }
-            }
-            _ => (content, None, HashMap::new()),
-        };
+                }),
+            MsgType::Voice => line
+                .get_audio(
+                    backup,
+                    &self.account_files,
+                    &self.account,
+                    &Self::gen_md5(&contact.name),
+                )
+                .map(|(metadata, map)| {
+                    (
+                        "[voice]".into(),
+                        Some(metadata.clone().with_type(line.msg_type.clone())),
+                        map,
+                    )
+                }),
+            _ => None,
+        }
+        .unwrap_or_else(|| (content, None, HashMap::new()));
 
         let record = Record {
-            chat_type: "iOS WeChat".into(),
+            chat_type: "WeChat".into(),
             owner_id: self.wxid.clone(),
             group_id: contact.name.clone(),
             sender_id,
