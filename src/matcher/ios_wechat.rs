@@ -146,6 +146,19 @@ impl RecordLine {
         ])
     }
 
+    pub fn get_video(
+        &self,
+        backup: &Backup,
+        backups: &HashMap<String, BackupFile>,
+        account: &str,
+        hashed_user: &str,
+    ) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)> {
+        let (ftype, dir, ext) = ("video", "Video", "mp4");
+        Self::get_files(vec![self
+            .get_file(backup, backups, account, hashed_user, ftype, dir, ext)
+            .map(|(metadata, data)| (ftype.into(), metadata, data))])
+    }
+
     fn get_image_small(
         &self,
         backup: &Backup,
@@ -604,6 +617,20 @@ impl UserDB {
                     (
                         "[img]".into(),
                         Some(metadata.with_type(line.msg_type.clone())),
+                        map,
+                    )
+                }),
+            MsgType::Video | MsgType::ShortVideo => line
+                .get_video(
+                    backup,
+                    &self.account_files,
+                    &self.account,
+                    &Self::gen_md5(&contact.name),
+                )
+                .map(|(metadata, map)| {
+                    (
+                        "[video]".into(),
+                        Some(metadata.clone().with_type(line.msg_type.clone())),
                         map,
                     )
                 }),
