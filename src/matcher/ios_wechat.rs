@@ -546,6 +546,43 @@ impl UserDB {
         }
     }
 
+    fn get_from_user_id(&self, content: &str) -> Option<(String, String)> {
+        lazy_static! {
+            static ref FROM_MATCH: Regex = Regex::new(r#"fromusername\s*?=\s*?"(.*?)""#).unwrap();
+        }
+        FROM_MATCH
+            .captures(content)
+            .filter(|c| c.len() == 2)
+            .and_then(|c| self.contacts.get(&Self::gen_md5(&c[1])))
+            .and_then(|c| c.get_remark().map(|r| (c.name.clone(), r)).ok())
+    }
+
+    fn parse_user_info(&self, content: &str) -> Option<(String, String, String)> {
+        lazy_static! {
+            static ref FIRST_LINE_USER_ID_MATCH: Regex =
+                Regex::new(r#"^\s*(.*?)\s*?:\s*?\n"#).unwrap();
+        }
+        FIRST_LINE_USER_ID_MATCH
+            .captures(content)
+            .filter(|c| c.len() == 2)
+            .and_then(|c| self.contacts.get(&Self::gen_md5(&c[1])))
+            .and_then(|c| {
+                c.get_remark()
+                    .map(|r| {
+                        (
+                            c.name.clone(),
+                            r,
+                            content.split("\n").skip(1).collect::<Vec<_>>().join("\n"),
+                        )
+                    })
+                    .ok()
+            })
+            .or_else(|| {
+                self.get_from_user_id(content)
+                    .map(|(id, remark)| (id, remark, content.into()))
+            })
+    }
+
     fn transfrom_record_line(
         &self,
         backup: &Backup,
@@ -556,18 +593,9 @@ impl UserDB {
         let (sender_id, sender_name, content) = {
             if line.is_dest {
                 if is_group {
-                    if let Some(idx) = line.message.find('\n') {
-                        let id = &line.message[0..idx - 1];
-                        if let Some((id, remark)) = self
-                            .contacts
-                            .get(&Self::gen_md5(id))
-                            .and_then(|c| c.get_remark().map(|r| (c.name.clone(), r)).ok())
-                        {
-                            (id, remark, line.message[idx + 1..].into())
-                        } else {
-                            debug!("wxid {} not found in contacts", id);
-                            (id.into(), "".into(), line.message[idx + 1..].into())
-                        }
+                    if let Some((id, remark, content)) = self.parse_user_info(&line.message)
+                    {
+                        (id, remark, content)
                     } else if [
                         MsgType::BigEmoji,
                         MsgType::CustomApp,
@@ -577,11 +605,15 @@ impl UserDB {
                     ]
                     .contains(&line.msg_type)
                     {
-                        (
-                            contact.name.clone(),
-                            contact.get_remark().unwrap_or_default(),
-                            line.message.clone(),
-                        )
+                        if let Some((id, remark)) = self.get_from_user_id(&line.message) {
+                            (id, remark, line.message.clone())
+                        } else {
+                            (
+                                contact.name.clone(),
+                                contact.get_remark().unwrap_or_default(),
+                                line.message.clone(),
+                            )
+                        }
                     } else {
                         return Err(format!(
                             "new line not exists in a group line: {}, {}, {:?}",
