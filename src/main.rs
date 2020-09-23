@@ -21,13 +21,11 @@ fn main() -> Result<()> {
                 SubCommand::QQ { owner, .. } => ExportType::WindowsQQ(path, owner.into()),
                 SubCommand::WeChat { chat_names, .. } => ExportType::iOSWeChat(
                     path,
-                    if chat_names.is_empty() { // query by chat id
-                        None
-                    } else if ["true", " "].contains(&chat_names.as_str()) { // query by chat name
-                        Some(vec![])
-                    } else { // query by chat name
-                        Some(chat_names.split(',').map(|s| s.into()).collect())
-                    },
+                    chat_names.as_ref().map(|names| {
+                        (!names.is_empty())
+                            .then_some(names.split(',').map(|s| s.into()).collect())
+                            .unwrap_or_default()
+                    }),
                 ),
                 SubCommand::SMS { owner, .. } => ExportType::iOSSMS(path, owner.into()),
             },

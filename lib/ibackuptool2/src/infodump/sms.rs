@@ -27,6 +27,7 @@ impl Sender {
         }
     }
 
+    #[allow(dead_code)]
     fn me() -> Sender {
         Sender {
             rowid: 0,
