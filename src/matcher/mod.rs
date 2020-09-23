@@ -1,7 +1,7 @@
 mod ios_sms;
 mod ios_wechat;
-mod windows_qq_html;
-mod windows_qq_mht;
+mod win_qq_html;
+mod win_qq_mht;
 
 use gchdb::{Blob, Record, RecordType};
 use htmlescape::decode_html;
@@ -32,7 +32,7 @@ where
     P: AsRef<Path>,
 {
     let matcher = match export_type {
-        ExportType::WindowsQQ(path, owner) => windows_qq_mht::Matcher::new(
+        ExportType::WindowsQQ(path, owner) => win_qq_mht::Matcher::new(
             &read(&path)?,
             owner,
             path.as_ref()

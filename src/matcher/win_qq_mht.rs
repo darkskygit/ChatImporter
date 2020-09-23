@@ -2,7 +2,7 @@ use super::*;
 use mailparse::{parse_mail, MailParseError};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use windows_qq_html::{Extractor, QQAttachGetter, QQMsgImage};
+use win_qq_html::{Extractor, QQAttachGetter, QQMsgImage};
 
 pub struct Matcher {
     qq_html_matcher: Extractor,
