@@ -17,7 +17,9 @@ This tool is based on another crate [gchdb](https://github.com/darkskygit/GCHDB)
 Backup your qq chat records into mht files in QQ's chat history manager and don't rename them.
 
 ``` sh
-cargo run --release -- -o your_qq_number <mht_folder_path>
+cargo run --release -- qq -o your_qq_number <mht_folder_path>
+cargo run --release -- wc -c full_id_or_partial_name <ios_backup_folder_path>
+cargo run --release -- sms -o your_nick_name <ios_backup_folder_path>
 ```
 
 # Contributing
