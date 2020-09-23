@@ -81,10 +81,27 @@ impl Default for MsgType {
     }
 }
 
+#[derive(Clone, Serialize)]
+#[serde(untagged)]
+enum MetadataType {
+    Int(i64),
+    Str(String),
+}
+
+impl MetadataType {
+    pub fn get_hash(&self) -> i64 {
+        if let Self::Int(ref i) = self {
+            *i
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Clone, Default, Serialize)]
 struct AttachMetadata {
     mtype: MsgType,
-    hash: HashMap<String, i64>,
+    hash: HashMap<String, MetadataType>,
 }
 
 impl AttachMetadata {
@@ -96,7 +113,12 @@ impl AttachMetadata {
     }
 
     pub fn with_hash(mut self, name: String, hash: i64) -> Self {
-        self.hash.insert(name, hash);
+        self.hash.insert(name, MetadataType::Int(hash));
+        self
+    }
+
+    pub fn with_tag(mut self, name: String, tag: String) -> Self {
+        self.hash.insert(name, MetadataType::Str(tag));
         self
     }
 
@@ -130,6 +152,44 @@ impl RecordLine {
         Self::get_files(vec![self
             .get_file(backup, backups, account, hashed_user, ftype, dir, ext)
             .map(|(metadata, data)| (ftype.into(), metadata, data))])
+    }
+
+    pub fn get_emoji(&self) -> AttachMetadata {
+        lazy_static! {
+            static ref MD5_MATCH: Regex = Regex::new(r#"md5\s*?=\s*?"(.*?)""#).unwrap();
+            static ref CDN_URL_MATCH: Regex = Regex::new(r#"cdnurl\s*?=\s*?"(.*?)""#).unwrap();
+            static ref AES_KEY_MATCH: Regex = Regex::new(r#"aeskey\s*?=\s*?"(.*?)""#).unwrap();
+            static ref ENC_URL_MATCH: Regex = Regex::new(r#"encrypturl\s*?=\s*?"(.*?)""#).unwrap();
+            static ref EXTERN_MATCH: Regex = Regex::new(r#"externurl\s*?=\s*?"(.*?)""#).unwrap();
+        }
+
+        [
+            MD5_MATCH
+                .captures(&self.message)
+                .filter(|c| c.len() == 2)
+                .map(|c| ("md5", c[1].to_string())),
+            CDN_URL_MATCH
+                .captures(&self.message)
+                .filter(|c| c.len() == 2)
+                .map(|c| ("cdn", c[1].to_string())),
+            AES_KEY_MATCH
+                .captures(&self.message)
+                .filter(|c| c.len() == 2)
+                .map(|c| ("key", c[1].to_string())),
+            ENC_URL_MATCH
+                .captures(&self.message)
+                .filter(|c| c.len() == 2)
+                .map(|c| ("enc", c[1].to_string())),
+            EXTERN_MATCH
+                .captures(&self.message)
+                .filter(|c| c.len() == 2)
+                .map(|c| ("extern", c[1].to_string())),
+        ]
+        .iter()
+        .filter_map(|e| e.as_ref())
+        .fold(AttachMetadata::new(), |metadata, (k, v)| {
+            metadata.with_tag(k.to_string(), v.into())
+        })
     }
 
     pub fn get_image(
@@ -211,8 +271,8 @@ impl RecordLine {
             .fold(
                 (AttachMetadata::new(), HashMap::new()),
                 |(metadata, mut map), (ftype, hash, data)| {
-                    map.insert(hash.to_string(), data.clone());
-                    (metadata.with_hash(ftype, hash), map)
+                    map.insert(hash.get_hash().to_string(), data.clone());
+                    (metadata.with_hash(ftype, hash.get_hash()), map)
                 },
             );
         (!map.is_empty() && !metadata.hash.is_empty()).then_some((metadata, map))
@@ -593,8 +653,7 @@ impl UserDB {
         let (sender_id, sender_name, content) = {
             if line.is_dest {
                 if is_group {
-                    if let Some((id, remark, content)) = self.parse_user_info(&line.message)
-                    {
+                    if let Some((id, remark, content)) = self.parse_user_info(&line.message) {
                         (id, remark, content)
                     } else if [
                         MsgType::BigEmoji,
@@ -662,7 +721,7 @@ impl UserDB {
                 .map(|(metadata, map)| {
                     (
                         "[video]".into(),
-                        Some(metadata.clone().with_type(line.msg_type.clone())),
+                        Some(metadata.with_type(line.msg_type.clone())),
                         map,
                     )
                 }),
@@ -676,10 +735,15 @@ impl UserDB {
                 .map(|(metadata, map)| {
                     (
                         "[voice]".into(),
-                        Some(metadata.clone().with_type(line.msg_type.clone())),
+                        Some(metadata.with_type(line.msg_type.clone())),
                         map,
                     )
                 }),
+            MsgType::BigEmoji => Some((
+                "[emoji]".into(),
+                Some(line.get_emoji().with_type(line.msg_type.clone())),
+                HashMap::new(),
+            )),
             _ => None,
         }
         .unwrap_or_else(|| (content, None, HashMap::new()));
