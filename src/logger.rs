@@ -1,5 +1,5 @@
 use fern::Dispatch;
-use log::{Level, Log, Metadata, Record};
+use log::{Log, Metadata, Record};
 
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Dispatch::new()
@@ -12,7 +12,6 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
                 message
             ))
         })
-        .level(Level::Info.to_level_filter())
         .chain(Box::new(Logger {}) as Box<dyn Log>)
         .apply()
 }
@@ -20,12 +19,8 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 struct Logger;
 
 impl Log for Logger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        if cfg!(debug_assertions) {
-            true
-        } else {
-            metadata.level() <= Level::Warn
-        }
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
     }
 
     fn log(&self, record: &Record) {

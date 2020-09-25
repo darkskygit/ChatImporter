@@ -35,5 +35,5 @@ version = "0.4.11"
 features = ["max_level_trace", "release_max_level_info"]
 
 [dependencies.structopt]
-version = "0.3.17"
+version = "0.3.18"
 default-features = false

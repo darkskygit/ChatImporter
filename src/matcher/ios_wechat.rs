@@ -28,7 +28,7 @@ impl ContactRemark {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Contact {
     pub name: String,
     remark: Vec<u8>,
@@ -37,6 +37,12 @@ struct Contact {
 }
 
 impl Contact {
+    pub fn from_name(name: String) -> Self {
+        Self {
+            name,
+            ..Default::default()
+        }
+    }
     pub fn get_remark(&self) -> Result<String, Box<dyn std::error::Error>> {
         Ok(Cursor::new(&self.remark)
             .read_le::<ContactRemark>()?
@@ -141,6 +147,29 @@ struct RecordLine {
 }
 
 impl RecordLine {
+    pub fn get_video_metadata(&self) -> AttachMetadata {
+        lazy_static! {
+            static ref CDN_URL_MATCH: Regex = Regex::new(r#"cdnvideourl\s*?=\s*?"(.*?)""#).unwrap();
+            static ref AES_KEY_MATCH: Regex = Regex::new(r#"aeskey\s*?=\s*?"(.*?)""#).unwrap();
+        }
+
+        [
+            CDN_URL_MATCH
+                .captures(&self.message)
+                .filter(|c| c.len() == 2)
+                .map(|c| ("cdn", c[1].to_string())),
+            AES_KEY_MATCH
+                .captures(&self.message)
+                .filter(|c| c.len() == 2)
+                .map(|c| ("key", c[1].to_string())),
+        ]
+        .iter()
+        .filter_map(|e| e.as_ref())
+        .fold(AttachMetadata::new(), |metadata, (k, v)| {
+            metadata.with_tag(k.to_string(), v.into())
+        })
+    }
+
     pub fn get_audio(
         &self,
         backup: &Backup,
@@ -294,7 +323,7 @@ impl RecordLine {
                 account, folder, hashed_user, self.local_id, ext
             ))
             .or_else(|| {
-                warn!(
+                debug!(
                     "{} not found: {}, {}, {}",
                     file_type, account, hashed_user, self.local_id
                 );
@@ -530,7 +559,7 @@ impl UserDB {
                         || c.name.find(&name).is_some()
                         || c.get_remark().ok().and_then(|r| r.find(&name)).is_some())
                     .then(|| {
-                        info!(
+                        warn!(
                             "Chat table found: {}, {}, {}",
                             hash,
                             c.name,
@@ -613,8 +642,13 @@ impl UserDB {
         FROM_MATCH
             .captures(content)
             .filter(|c| c.len() == 2)
-            .and_then(|c| self.contacts.get(&Self::gen_md5(&c[1])))
-            .and_then(|c| c.get_remark().map(|r| (c.name.clone(), r)).ok())
+            .map(|c| {
+                self.contacts
+                    .get(&Self::gen_md5(&c[1]))
+                    .map(|c| c.clone())
+                    .unwrap_or_else(|| Contact::from_name(c[1].into()))
+            })
+            .map(|c| (c.name.clone(), c.get_remark().unwrap_or_default()))
     }
 
     fn parse_user_info(&self, content: &str) -> Option<(String, String, String)> {
@@ -625,17 +659,18 @@ impl UserDB {
         FIRST_LINE_USER_ID_MATCH
             .captures(content)
             .filter(|c| c.len() == 2)
-            .and_then(|c| self.contacts.get(&Self::gen_md5(&c[1])))
-            .and_then(|c| {
-                c.get_remark()
-                    .map(|r| {
-                        (
-                            c.name.clone(),
-                            r,
-                            content.split("\n").skip(1).collect::<Vec<_>>().join("\n"),
-                        )
-                    })
-                    .ok()
+            .map(|c| {
+                self.contacts
+                    .get(&Self::gen_md5(&c[1]))
+                    .map(|c| c.clone())
+                    .unwrap_or_else(|| Contact::from_name(c[1].into()))
+            })
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.get_remark().unwrap_or_default(),
+                    content.split("\n").skip(1).collect::<Vec<_>>().join("\n"),
+                )
             })
             .or_else(|| {
                 self.get_from_user_id(content)
@@ -675,8 +710,11 @@ impl UserDB {
                         }
                     } else {
                         return Err(format!(
-                            "new line not exists in a group line: {}, {}, {:?}",
-                            line.local_id, line.created_time, line.msg_type
+                            "new line not exists in a group line: {}, {}, {}, {:?}",
+                            Self::gen_md5(&contact.name),
+                            line.local_id,
+                            line.created_time,
+                            line.msg_type
                         ));
                     }
                 } else {
@@ -724,6 +762,13 @@ impl UserDB {
                         Some(metadata.with_type(line.msg_type.clone())),
                         map,
                     )
+                })
+                .or_else(|| {
+                    Some((
+                        "[video]".into(),
+                        Some(line.get_video_metadata()),
+                        HashMap::new(),
+                    ))
                 }),
             MsgType::Voice => line
                 .get_audio(
@@ -819,24 +864,23 @@ impl UserDB {
             })
     }
 
-    pub fn get_records(&self, backup: &Backup, names: Option<Vec<String>>) -> Vec<RecordType> {
+    pub fn get_record_names(&self, names: Option<Vec<String>>) -> Vec<String> {
         match names {
             None => self.get_chat_ids(),
             Some(names) if names.is_empty() => self.get_contacts(),
             Some(names) => names,
         }
-        .iter()
-        .flat_map(|name| {
-            self.find_contacts(name)
-                .iter()
-                .filter_map(|chat_id| {
-                    info!("Extracting: {} => {}", name, chat_id);
-                    self.load_records(backup, chat_id)
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>()
+    }
+
+    pub fn get_records(&self, backup: &Backup, name: String) -> Vec<RecordType> {
+        self.find_contacts(&name)
+            .iter()
+            .filter_map(|chat_id| {
+                info!("Extracting: {} => {}", name, chat_id);
+                self.load_records(backup, chat_id)
+            })
+            .flatten()
+            .collect::<Vec<_>>()
     }
 }
 
@@ -949,7 +993,13 @@ impl MsgMatcher for Matcher {
             self.extract_ids
                 .iter()
                 .filter_map(|u| self.extractor.get_user_db(u))
-                .flat_map(|(user_db, backup)| user_db.get_records(backup, self.names.clone()))
+                .flat_map(|(user_db, backup)| {
+                    user_db
+                        .get_record_names(self.names.clone())
+                        .iter()
+                        .flat_map(|name| user_db.get_records(backup, name.clone()))
+                        .collect::<Vec<_>>()
+                })
                 .collect(),
         )
     }

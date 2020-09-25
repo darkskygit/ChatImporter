@@ -12,4 +12,4 @@ pub use self::infodump::*;
 pub use self::plist::*;
 pub use self::util::*;
 
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, trace};
