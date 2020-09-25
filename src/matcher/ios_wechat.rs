@@ -766,7 +766,7 @@ impl UserDB {
                 .or_else(|| {
                     Some((
                         "[video]".into(),
-                        Some(line.get_video_metadata()),
+                        Some(line.get_video_metadata().with_type(line.msg_type.clone())),
                         HashMap::new(),
                     ))
                 }),
