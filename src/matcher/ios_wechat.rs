@@ -218,6 +218,32 @@ impl RecordLine {
             .map(|(metadata, data)| (ftype.into(), metadata, data))])
     }
 
+    pub fn get_contact(&self) -> AttachMetadata {
+        lazy_static! {
+            static ref NICKNAME_MATCH: Regex = Regex::new(r#"nickname\s*?=\s*?"(.*?)""#).unwrap();
+            static ref USERNAME_MATCH: Regex = Regex::new(r#"username\s*?=\s*?"(.*?)""#).unwrap();
+            static ref CITY_MATCH: Regex = Regex::new(r#"city\s*?=\s*?"(.*?)""#).unwrap();
+            static ref PROVINCE_MATCH: Regex = Regex::new(r#"province\s*?=\s*?"(.*?)""#).unwrap();
+            static ref BIG_IMG_MATCH: Regex =
+                Regex::new(r#"bigheadimgurl\s*?=\s*?"(.*?)""#).unwrap();
+            static ref SMALL_IMG_MATCH: Regex =
+                Regex::new(r#"smallheadimgurl\s*?=\s*?"(.*?)""#).unwrap();
+        }
+        [
+            self.get_match_string(&*NICKNAME_MATCH, "nickname"),
+            self.get_match_string(&*USERNAME_MATCH, "username"),
+            self.get_match_string(&*CITY_MATCH, "city"),
+            self.get_match_string(&*PROVINCE_MATCH, "province"),
+            self.get_match_string(&*BIG_IMG_MATCH, "head")
+                .or_else(|| self.get_match_string(&*SMALL_IMG_MATCH, "head")),
+        ]
+        .iter()
+        .filter_map(|e| e.as_ref())
+        .fold(AttachMetadata::new(), |metadata, (k, v)| {
+            metadata.with_tag(k.to_string(), v.into())
+        })
+    }
+
     pub fn get_emoji(&self) -> AttachMetadata {
         lazy_static! {
             static ref MD5_MATCH: Regex = Regex::new(r#"md5\s*?=\s*?"(.*?)""#).unwrap();
@@ -834,6 +860,11 @@ impl UserDB {
             MsgType::BigEmoji => Some((
                 "[emoji]".into(),
                 Some(line.get_emoji().with_type(line.msg_type.clone())),
+                HashMap::new(),
+            )),
+            MsgType::ContactShare => Some((
+                "[contact]".into(),
+                Some(line.get_contact().with_type(line.msg_type.clone())),
                 HashMap::new(),
             )),
             _ => None,
