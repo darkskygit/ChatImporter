@@ -87,7 +87,6 @@ impl Backup {
         return None;
     }
 
-    #[allow(dead_code)]
     pub fn find_wildcard_paths(&self, domain: &str, path: &str) -> Vec<BackupFile> {
         use wildmatch::WildMatch;
         let matcher = WildMatch::new(path);
@@ -98,6 +97,21 @@ impl Backup {
             }
         }
         return paths;
+    }
+
+    pub fn find_regex_paths(&self, domain: &str, path: &str) -> Vec<BackupFile> {
+        use regex::Regex;
+        if let Ok(matcher) = Regex::new(path) {
+            let mut paths = vec![];
+            for file in &self.files {
+                if file.domain == domain && matcher.is_match(&file.relative_filename) {
+                    paths.push(file.clone());
+                }
+            }
+            paths
+        } else {
+            vec![]
+        }
     }
 
     #[allow(dead_code)]

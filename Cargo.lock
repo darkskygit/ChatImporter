@@ -1012,6 +1012,7 @@ dependencies = [
  "libsqlite3-sys",
  "log",
  "plist",
+ "regex",
  "ring",
  "rusqlite",
  "rust-crypto",

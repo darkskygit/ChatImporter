@@ -14,6 +14,8 @@ use std::str::{from_utf8, Utf8Error};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
+const DOMAIN: &str = "AppDomain-com.tencent.xin";
+
 #[derive(BinRead)]
 #[br(little, magic = b"\n")]
 struct ContactRemark {
@@ -91,6 +93,7 @@ impl Default for MsgType {
 #[serde(untagged)]
 enum MetadataType {
     Int(i64),
+    Float(f64),
     Str(String),
 }
 
@@ -121,6 +124,16 @@ impl AttachMetadata {
 
     pub fn with_hash(mut self, name: String, hash: i64) -> Self {
         self.hash.insert(name, MetadataType::Int(hash));
+        self
+    }
+
+    pub fn with_float(mut self, name: String, tag: String) -> Self {
+        self.hash.insert(
+            name,
+            tag.parse()
+                .map(|f| MetadataType::Float(f))
+                .unwrap_or(MetadataType::Str(tag)),
+        );
         self
     }
 
@@ -244,6 +257,78 @@ impl RecordLine {
         })
     }
 
+    pub fn get_custom_app(
+        &self,
+        backup: &Backup,
+        account: &str,
+        hashed_user: &str,
+    ) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)> {
+        lazy_static! {
+            static ref TITLE_MATCH: Regex = Regex::new(r"<title>(.*?)</title>").unwrap();
+            static ref TITLE_CDATA_MATCH: Regex =
+                Regex::new(r"<title><!\[CDATA\[((?s).*?)]]></title>").unwrap();
+            static ref DESCRIPTION_MATCH: Regex = Regex::new(r"<des>((?s).*?)</des>").unwrap();
+            static ref DESCRIPTION_CDATA_MATCH: Regex =
+                Regex::new(r"<des><!\[CDATA\[((?s).*?)]]></des>").unwrap();
+            static ref THUM_MATCH: Regex =
+                Regex::new(r"<thumburl><!\[CDATA\[((?s).*?)]]></thumburl>").unwrap();
+            static ref RECORD_INFO_MATCH: Regex =
+                Regex::new(r"<recorditem><!\[CDATA\[((?s).*?)]]></recorditem>").unwrap();
+            static ref RECORD_INFO_ESCAPE_MATCH: Regex =
+                Regex::new(r"<recorditem>((?s).*?)</recorditem>").unwrap();
+        }
+        let path = format!(
+            "Documents/{}/{}/{}/{}",
+            account, "OpenData", hashed_user, self.local_id
+        );
+        let files = if self.skip_resource {
+            HashMap::new()
+        } else {
+            backup
+                .find_regex_paths(DOMAIN, &format!("{}[\\./]", path))
+                .iter()
+                .filter_map(|file| {
+                    use std::path::PathBuf;
+                    let path = PathBuf::from(&file.relative_filename);
+                    backup
+                        .read_file(file)
+                        .map(|data| (path.name_str().to_string(), data))
+                        .map_err(|e| {
+                            warn!(
+                                "failed to read attach: {}, {}, {}, {}, {}",
+                                account,
+                                hashed_user,
+                                self.local_id,
+                                path.name_str(),
+                                e
+                            )
+                        })
+                        .ok()
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let metadata = [
+            self.get_match_string(&*TITLE_MATCH, "title")
+                .or_else(|| self.get_match_string(&*TITLE_CDATA_MATCH, "title")),
+            self.get_match_string(&*DESCRIPTION_MATCH, "description")
+                .or_else(|| self.get_match_string(&*DESCRIPTION_CDATA_MATCH, "description")),
+            self.get_match_string(&*THUM_MATCH, "thum"),
+            self.get_match_string(&*RECORD_INFO_MATCH, "record")
+                .or_else(|| self.get_match_string(&*RECORD_INFO_ESCAPE_MATCH, "head")),
+        ]
+        .iter()
+        .filter_map(|e| e.as_ref())
+        .fold(AttachMetadata::new(), |metadata, (k, v)| {
+            metadata.with_tag(k.to_string(), v.into())
+        });
+        Some((
+            files.iter().fold(metadata, |metadata, (name, data)| {
+                metadata.with_hash(format!("attach:{}", name), Blob::new(data.clone()).hash)
+            }),
+            files,
+        ))
+    }
+
     pub fn get_emoji(&self) -> AttachMetadata {
         lazy_static! {
             static ref MD5_MATCH: Regex = Regex::new(r#"md5\s*?=\s*?"(.*?)""#).unwrap();
@@ -278,6 +363,34 @@ impl RecordLine {
             self.get_image_small(backup, backups, account, hashed_user),
             self.get_image_hd(backup, backups, account, hashed_user),
         ])
+    }
+
+    pub fn get_location(&self) -> AttachMetadata {
+        lazy_static! {
+            static ref X_MATCH: Regex = Regex::new(r#" x\s*?=\s*?"(.*?)""#).unwrap();
+            static ref Y_MATCH: Regex = Regex::new(r#" y\s*?=\s*?"(.*?)""#).unwrap();
+            static ref LABEL_MATCH: Regex = Regex::new(r#"label\s*?=\s*?"(.*?)""#).unwrap();
+            static ref NAME_MATCH: Regex = Regex::new(r#"poiname\s*?=\s*?"(.*?)""#).unwrap();
+        }
+
+        [
+            self.get_match_string(&*LABEL_MATCH, "label"),
+            self.get_match_string(&*NAME_MATCH, "name"),
+        ]
+        .iter()
+        .filter_map(|e| e.as_ref())
+        .fold(
+            [
+                self.get_match_string(&*X_MATCH, "x"),
+                self.get_match_string(&*Y_MATCH, "y"),
+            ]
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .fold(AttachMetadata::new(), |metadata, (k, v)| {
+                metadata.with_float(k.to_string(), v.into())
+            }),
+            |metadata, (k, v)| metadata.with_tag(k.to_string(), v.into()),
+        )
     }
 
     pub fn get_video(
@@ -695,10 +808,24 @@ impl UserDB {
     fn get_from_user_id(&self, content: &str) -> Option<(String, String)> {
         lazy_static! {
             static ref FROM_MATCH: Regex = Regex::new(r#"fromusername\s*?=\s*?"(.*?)""#).unwrap();
+            static ref XML_FROM_MATCH: Regex =
+                Regex::new(r"<fromusername>((?s).*?)</fromusername>").unwrap();
+            static ref XML_CDATA_FROM_MATCH: Regex =
+                Regex::new(r"<fromusername><!\[CDATA\[((?s).*?)]]></fromusername>").unwrap();
         }
         FROM_MATCH
             .captures(content)
             .filter(|c| c.len() == 2 && !c[1].is_empty())
+            .or_else(|| {
+                XML_FROM_MATCH
+                    .captures(content)
+                    .filter(|c| c.len() == 2 && !c[1].is_empty())
+            })
+            .or_else(|| {
+                XML_CDATA_FROM_MATCH
+                    .captures(content)
+                    .filter(|c| c.len() == 2 && !c[1].is_empty())
+            })
             .map(|c| {
                 self.contacts
                     .get(&gen_md5(&c[1]))
@@ -867,6 +994,20 @@ impl UserDB {
                 Some(line.get_contact().with_type(line.msg_type.clone())),
                 HashMap::new(),
             )),
+            MsgType::Location => Some((
+                "[location]".into(),
+                Some(line.get_location().with_type(line.msg_type.clone())),
+                HashMap::new(),
+            )),
+            MsgType::CustomApp => line
+                .get_custom_app(backup, &self.account, &gen_md5(&contact.name))
+                .map(|(metadata, map)| {
+                    (
+                        "[app]".into(),
+                        Some(metadata.with_type(line.msg_type.clone())),
+                        map,
+                    )
+                }),
             _ => None,
         }
         .unwrap_or_else(|| (content, None, HashMap::new()));
@@ -987,7 +1128,6 @@ impl Extractor {
     }
 
     fn get_user_info(backup: &Backup) -> HashMap<String, UserDB> {
-        const DOMAIN: &str = "AppDomain-com.tencent.xin";
         const MATCHED_NAME: [&str; 4] = [
             "WCDB_Contact.sqlite",
             "MM.sqlite",
