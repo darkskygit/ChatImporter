@@ -272,6 +272,10 @@ impl RecordLine {
                 Regex::new(r"<des><!\[CDATA\[((?s).*?)]]></des>").unwrap();
             static ref THUM_MATCH: Regex =
                 Regex::new(r"<thumburl><!\[CDATA\[((?s).*?)]]></thumburl>").unwrap();
+            static ref APPNAME_MATCH: Regex = Regex::new(r"<appname>(.*?)</appname>").unwrap();
+            static ref URL_MATCH: Regex = Regex::new(r"<url>(.*?)</url>").unwrap();
+            static ref URL_CDATA_MATCH: Regex =
+                Regex::new(r"<url><!\[CDATA\[((?s).*?)]]></url>").unwrap();
             static ref RECORD_INFO_MATCH: Regex =
                 Regex::new(r"<recorditem><!\[CDATA\[((?s).*?)]]></recorditem>").unwrap();
             static ref RECORD_INFO_ESCAPE_MATCH: Regex =
@@ -308,13 +312,16 @@ impl RecordLine {
                 .collect::<HashMap<_, _>>()
         };
         let metadata = [
-            self.get_match_string(&*TITLE_MATCH, "title")
-                .or_else(|| self.get_match_string(&*TITLE_CDATA_MATCH, "title")),
-            self.get_match_string(&*DESCRIPTION_MATCH, "description")
-                .or_else(|| self.get_match_string(&*DESCRIPTION_CDATA_MATCH, "description")),
+            self.get_match_string(&*TITLE_CDATA_MATCH, "title")
+                .or_else(|| self.get_match_string(&*TITLE_MATCH, "title")),
+            self.get_match_string(&*DESCRIPTION_CDATA_MATCH, "description")
+                .or_else(|| self.get_match_string(&*DESCRIPTION_MATCH, "description")),
             self.get_match_string(&*THUM_MATCH, "thum"),
             self.get_match_string(&*RECORD_INFO_MATCH, "record")
-                .or_else(|| self.get_match_string(&*RECORD_INFO_ESCAPE_MATCH, "head")),
+                .or_else(|| self.get_match_string(&*RECORD_INFO_ESCAPE_MATCH, "record")),
+            self.get_match_string(&*APPNAME_MATCH, "app"),
+            self.get_match_string(&*URL_CDATA_MATCH, "url")
+                .or_else(|| self.get_match_string(&*URL_MATCH, "url")),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
