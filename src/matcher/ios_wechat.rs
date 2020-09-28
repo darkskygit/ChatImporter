@@ -107,6 +107,7 @@ impl MetadataType {
 #[derive(Clone, Default, Serialize)]
 struct AttachMetadata {
     mtype: MsgType,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     hash: HashMap<String, MetadataType>,
 }
 
@@ -144,24 +145,58 @@ struct RecordLine {
     image_status: u8,
     msg_type: MsgType,
     is_dest: bool,
+    skip_resource: bool,
 }
 
 impl RecordLine {
+    pub fn get_audio_metadata(&self) -> AttachMetadata {
+        lazy_static! {
+            static ref CLIENT_ID_MATCH: Regex =
+                Regex::new(r#"clientmsgid\s*?=\s*?"(.*?)""#).unwrap();
+            static ref BUFFER_ID_MATCH: Regex = Regex::new(r#"bufid\s*?=\s*?"(.*?)""#).unwrap();
+        }
+        [
+            self.get_match_string(&*BUFFER_ID_MATCH, "bufid"),
+            self.get_match_string(&*CLIENT_ID_MATCH, "clientid"),
+        ]
+        .iter()
+        .filter_map(|e| e.as_ref())
+        .fold(AttachMetadata::new(), |metadata, (k, v)| {
+            metadata.with_tag(k.to_string(), v.into())
+        })
+    }
+
+    pub fn get_image_metadata(&self) -> AttachMetadata {
+        lazy_static! {
+            static ref CDN_THUM_URL_MATCH: Regex =
+                Regex::new(r#"cdnthumburl\s*?=\s*?"(.*?)""#).unwrap();
+            static ref CDN_SMALL_URL_MATCH: Regex =
+                Regex::new(r#"cdnmidimgurl\s*?=\s*?"(.*?)""#).unwrap();
+            static ref CDN_HD_URL_MATCH: Regex =
+                Regex::new(r#"cdnbigimgurl\s*?=\s*?"(.*?)""#).unwrap();
+            static ref AES_KEY_MATCH: Regex = Regex::new(r#"aeskey\s*?=\s*?"(.*?)""#).unwrap();
+        }
+        [
+            self.get_match_string(&*CDN_THUM_URL_MATCH, "thum_cdn"),
+            self.get_match_string(&*CDN_SMALL_URL_MATCH, "img_cdn"),
+            self.get_match_string(&*CDN_HD_URL_MATCH, "hd_cdn"),
+            self.get_match_string(&*AES_KEY_MATCH, "key"),
+        ]
+        .iter()
+        .filter_map(|e| e.as_ref())
+        .fold(AttachMetadata::new(), |metadata, (k, v)| {
+            metadata.with_tag(k.to_string(), v.into())
+        })
+    }
+
     pub fn get_video_metadata(&self) -> AttachMetadata {
         lazy_static! {
             static ref CDN_URL_MATCH: Regex = Regex::new(r#"cdnvideourl\s*?=\s*?"(.*?)""#).unwrap();
             static ref AES_KEY_MATCH: Regex = Regex::new(r#"aeskey\s*?=\s*?"(.*?)""#).unwrap();
         }
-
         [
-            CDN_URL_MATCH
-                .captures(&self.message)
-                .filter(|c| c.len() == 2)
-                .map(|c| ("cdn", c[1].to_string())),
-            AES_KEY_MATCH
-                .captures(&self.message)
-                .filter(|c| c.len() == 2)
-                .map(|c| ("key", c[1].to_string())),
+            self.get_match_string(&*CDN_URL_MATCH, "cdn"),
+            self.get_match_string(&*AES_KEY_MATCH, "key"),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
@@ -191,28 +226,12 @@ impl RecordLine {
             static ref ENC_URL_MATCH: Regex = Regex::new(r#"encrypturl\s*?=\s*?"(.*?)""#).unwrap();
             static ref EXTERN_MATCH: Regex = Regex::new(r#"externurl\s*?=\s*?"(.*?)""#).unwrap();
         }
-
         [
-            MD5_MATCH
-                .captures(&self.message)
-                .filter(|c| c.len() == 2)
-                .map(|c| ("md5", c[1].to_string())),
-            CDN_URL_MATCH
-                .captures(&self.message)
-                .filter(|c| c.len() == 2)
-                .map(|c| ("cdn", c[1].to_string())),
-            AES_KEY_MATCH
-                .captures(&self.message)
-                .filter(|c| c.len() == 2)
-                .map(|c| ("key", c[1].to_string())),
-            ENC_URL_MATCH
-                .captures(&self.message)
-                .filter(|c| c.len() == 2)
-                .map(|c| ("enc", c[1].to_string())),
-            EXTERN_MATCH
-                .captures(&self.message)
-                .filter(|c| c.len() == 2)
-                .map(|c| ("extern", c[1].to_string())),
+            self.get_match_string(&*MD5_MATCH, "md5"),
+            self.get_match_string(&*CDN_URL_MATCH, "cdn"),
+            self.get_match_string(&*AES_KEY_MATCH, "key"),
+            self.get_match_string(&*ENC_URL_MATCH, "enc"),
+            self.get_match_string(&*EXTERN_MATCH, "extern"),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
@@ -317,35 +336,47 @@ impl RecordLine {
         folder: &str,
         ext: &str,
     ) -> Option<(AttachMetadata, Vec<u8>)> {
-        backups
-            .get(&format!(
-                "Documents/{}/{}/{}/{}.{}",
-                account, folder, hashed_user, self.local_id, ext
-            ))
-            .or_else(|| {
-                debug!(
-                    "{} not found: {}, {}, {}",
-                    file_type, account, hashed_user, self.local_id
-                );
-                None
-            })
-            .and_then(|file| {
-                backup
-                    .read_file(file)
-                    .map_err(|e| {
-                        warn!(
-                            "failed to read {}: {}, {}, {}, {}",
-                            file_type, account, hashed_user, self.local_id, e
-                        )
-                    })
-                    .ok()
-            })
-            .map(|data| {
-                (
-                    AttachMetadata::new().with_hash(file_type.into(), Blob::new(data.clone()).hash),
-                    data,
-                )
-            })
+        if self.skip_resource {
+            None
+        } else {
+            backups
+                .get(&format!(
+                    "Documents/{}/{}/{}/{}.{}",
+                    account, folder, hashed_user, self.local_id, ext
+                ))
+                .or_else(|| {
+                    debug!(
+                        "{} not found: {}, {}, {}",
+                        file_type, account, hashed_user, self.local_id
+                    );
+                    None
+                })
+                .and_then(|file| {
+                    backup
+                        .read_file(file)
+                        .map_err(|e| {
+                            warn!(
+                                "failed to read {}: {}, {}, {}, {}",
+                                file_type, account, hashed_user, self.local_id, e
+                            )
+                        })
+                        .ok()
+                })
+                .map(|data| {
+                    (
+                        AttachMetadata::new()
+                            .with_hash(file_type.into(), Blob::new(data.clone()).hash),
+                        data,
+                    )
+                })
+        }
+    }
+
+    fn get_match_string<'a>(&self, regex: &Regex, key: &'a str) -> Option<(&'a str, String)> {
+        regex
+            .captures(&self.message)
+            .filter(|c| c.len() == 2 && !c[1].is_empty())
+            .map(|c| (key, hex2b64(&c[1])))
     }
 }
 
@@ -524,7 +555,7 @@ impl UserDB {
                 .query_map(params![], |row| {
                     let name = row.get(0)?;
                     Ok((
-                        Self::gen_md5(&name),
+                        gen_md5(&name),
                         Contact {
                             name,
                             remark: row.get(1)?,
@@ -583,12 +614,11 @@ impl UserDB {
             .collect()
     }
 
-    fn gen_md5<S: ToString>(user_name: S) -> String {
-        use md5::{Digest, Md5};
-        format!("{:x}", Md5::digest(user_name.to_string().as_bytes()))
-    }
-
-    fn load_record_lines<S: ToString>(&self, user_name: S) -> SqliteResult<Vec<RecordLine>> {
+    fn load_record_lines<S: ToString>(
+        &self,
+        user_name: S,
+        skip_resource: bool,
+    ) -> SqliteResult<Vec<RecordLine>> {
         if let Some(conn) = Self::get_conn(self.message.clone())? {
             let user_name = user_name.to_string();
             Ok(conn
@@ -608,7 +638,7 @@ impl UserDB {
                         .keys()
                         .find(|h| h.as_str() == user_name)
                         .map(|s| s.into())
-                        .unwrap_or_else(|| Self::gen_md5(user_name))
+                        .unwrap_or_else(|| gen_md5(user_name))
                 ))?
                 .query_map(params![], |row| {
                     Ok(RecordLine {
@@ -623,6 +653,7 @@ impl UserDB {
                             MsgType::Unknown
                         }),
                         is_dest: row.get(7)?,
+                        skip_resource,
                     })
                 })?
                 .filter_map(|r| {
@@ -641,10 +672,10 @@ impl UserDB {
         }
         FROM_MATCH
             .captures(content)
-            .filter(|c| c.len() == 2)
+            .filter(|c| c.len() == 2 && !c[1].is_empty())
             .map(|c| {
                 self.contacts
-                    .get(&Self::gen_md5(&c[1]))
+                    .get(&gen_md5(&c[1]))
                     .map(|c| c.clone())
                     .unwrap_or_else(|| Contact::from_name(c[1].into()))
             })
@@ -658,10 +689,10 @@ impl UserDB {
         }
         FIRST_LINE_USER_ID_MATCH
             .captures(content)
-            .filter(|c| c.len() == 2)
+            .filter(|c| c.len() == 2 && !c[1].is_empty())
             .map(|c| {
                 self.contacts
-                    .get(&Self::gen_md5(&c[1]))
+                    .get(&gen_md5(&c[1]))
                     .map(|c| c.clone())
                     .unwrap_or_else(|| Contact::from_name(c[1].into()))
             })
@@ -711,7 +742,7 @@ impl UserDB {
                     } else {
                         return Err(format!(
                             "new line not exists in a group line: {}, {}, {}, {:?}",
-                            Self::gen_md5(&contact.name),
+                            gen_md5(&contact.name),
                             line.local_id,
                             line.created_time,
                             line.msg_type
@@ -725,7 +756,9 @@ impl UserDB {
                     )
                 }
             } else {
-                (self.wxid.clone(), self.name.clone(), line.message.clone())
+                self.parse_user_info(&line.message)
+                    .map(|(_, _, content)| (self.wxid.clone(), self.name.clone(), content))
+                    .unwrap_or_else(|| (self.wxid.clone(), self.name.clone(), line.message.clone()))
             }
         };
 
@@ -740,7 +773,7 @@ impl UserDB {
                     backup,
                     &self.account_files,
                     &self.account,
-                    &Self::gen_md5(&contact.name),
+                    &gen_md5(&contact.name),
                 )
                 .map(|(metadata, map)| {
                     (
@@ -748,13 +781,20 @@ impl UserDB {
                         Some(metadata.with_type(line.msg_type.clone())),
                         map,
                     )
+                })
+                .or_else(|| {
+                    Some((
+                        "[img]".into(),
+                        Some(line.get_image_metadata().with_type(line.msg_type.clone())),
+                        HashMap::new(),
+                    ))
                 }),
             MsgType::Video | MsgType::ShortVideo => line
                 .get_video(
                     backup,
                     &self.account_files,
                     &self.account,
-                    &Self::gen_md5(&contact.name),
+                    &gen_md5(&contact.name),
                 )
                 .map(|(metadata, map)| {
                     (
@@ -775,7 +815,7 @@ impl UserDB {
                     backup,
                     &self.account_files,
                     &self.account,
-                    &Self::gen_md5(&contact.name),
+                    &gen_md5(&contact.name),
                 )
                 .map(|(metadata, map)| {
                     (
@@ -783,6 +823,13 @@ impl UserDB {
                         Some(metadata.with_type(line.msg_type.clone())),
                         map,
                     )
+                })
+                .or_else(|| {
+                    Some((
+                        "[voice]".into(),
+                        Some(line.get_audio_metadata().with_type(line.msg_type.clone())),
+                        HashMap::new(),
+                    ))
                 }),
             MsgType::BigEmoji => Some((
                 "[emoji]".into(),
@@ -848,7 +895,12 @@ impl UserDB {
             })
     }
 
-    fn load_records<S: ToString>(&self, backup: &Backup, chat_id: S) -> Option<Vec<RecordType>> {
+    fn load_records<S: ToString>(
+        &self,
+        backup: &Backup,
+        chat_id: S,
+        skip_resource: bool,
+    ) -> Option<Vec<RecordType>> {
         let chat_id = chat_id.to_string();
         self.contacts
             .get(&chat_id)
@@ -857,7 +909,7 @@ impl UserDB {
                 None
             })
             .and_then(|contact| {
-                self.load_record_lines(&chat_id)
+                self.load_record_lines(&chat_id, skip_resource)
                     .map(|lines| self.transfrom_record_lines(backup, contact, lines))
                     .map_err(|e| warn!("failed to get chat line: {}", e))
                     .ok()
@@ -872,12 +924,17 @@ impl UserDB {
         }
     }
 
-    pub fn get_records(&self, backup: &Backup, name: String) -> Vec<RecordType> {
+    pub fn get_records(
+        &self,
+        backup: &Backup,
+        name: String,
+        skip_resource: bool,
+    ) -> Vec<RecordType> {
         self.find_contacts(&name)
             .iter()
             .filter_map(|chat_id| {
                 info!("Extracting: {} => {}", name, chat_id);
-                self.load_records(backup, chat_id)
+                self.load_records(backup, chat_id, skip_resource)
             })
             .flatten()
             .collect::<Vec<_>>()
@@ -973,6 +1030,7 @@ pub struct Matcher {
     extractor: Extractor,
     extract_ids: Vec<String>,
     names: Option<Vec<String>>,
+    skip_resource: bool,
 }
 
 impl Matcher {
@@ -983,6 +1041,7 @@ impl Matcher {
             extractor,
             extract_ids,
             names,
+            skip_resource: true,
         }) as Box<dyn MsgMatcher>)
     }
 }
@@ -997,7 +1056,9 @@ impl MsgMatcher for Matcher {
                     user_db
                         .get_record_names(self.names.clone())
                         .iter()
-                        .flat_map(|name| user_db.get_records(backup, name.clone()))
+                        .flat_map(|name| {
+                            user_db.get_records(backup, name.clone(), self.skip_resource)
+                        })
                         .collect::<Vec<_>>()
                 })
                 .collect(),

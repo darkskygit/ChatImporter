@@ -12,4 +12,5 @@ pub use self::infodump::*;
 pub use self::plist::*;
 pub use self::util::*;
 
-use log::{debug, error, info, trace};
+#[allow(unused_imports)]
+use log::{debug, error, info, trace, warn};

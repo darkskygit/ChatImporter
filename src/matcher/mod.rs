@@ -71,6 +71,17 @@ where
     Ok(())
 }
 
+fn gen_md5<S: ToString>(user_name: S) -> String {
+    use md5::{Digest, Md5};
+    format!("{:x}", Md5::digest(user_name.to_string().as_bytes()))
+}
+
+fn hex2b64(hex: &str) -> String {
+    hex::decode(&hex)
+        .map(base64::encode)
+        .unwrap_or_else(|_| hex.into())
+}
+
 fn modify_timestamp(record_type: RecordType, near_sec: Option<i64>) -> Option<RecordType> {
     use std::cmp::max;
     if let Some(near_sec) = near_sec {
