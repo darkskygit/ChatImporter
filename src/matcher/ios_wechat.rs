@@ -400,6 +400,23 @@ impl RecordLine {
         )
     }
 
+    pub fn get_revoke(&self) -> AttachMetadata {
+        lazy_static! {
+            static ref REVOKE_MATCH: Regex =
+                Regex::new(r"<revokecontent>(.*?)</revokecontent>").unwrap();
+            static ref REVOKE_CDATA_MATCH: Regex =
+                Regex::new(r"<revokecontent><!\[CDATA\[((?s).*?)]]></revokecontent>").unwrap();
+        }
+        [self
+            .get_match_string(&*REVOKE_CDATA_MATCH, "revoke")
+            .or_else(|| self.get_match_string(&*REVOKE_MATCH, "revoke"))]
+        .iter()
+        .filter_map(|e| e.as_ref())
+        .fold(AttachMetadata::new(), |metadata, (k, v)| {
+            metadata.with_tag(k.to_string(), v.into())
+        })
+    }
+
     pub fn get_video(
         &self,
         backup: &Backup,
@@ -1015,6 +1032,29 @@ impl UserDB {
                         map,
                     )
                 }),
+            MsgType::VoipContent => Some((
+                "[voip]".into(),
+                Some(
+                    AttachMetadata::new()
+                        .with_tag("type".into(), line.message.clone())
+                        .with_type(line.msg_type.clone()),
+                ),
+                HashMap::new(),
+            )),
+            MsgType::System => Some((
+                "[system]".into(),
+                Some(
+                    AttachMetadata::new()
+                        .with_tag("content".into(), line.message.clone())
+                        .with_type(line.msg_type.clone()),
+                ),
+                HashMap::new(),
+            )),
+            MsgType::Revoke => Some((
+                "[revoke]".into(),
+                Some(line.get_revoke().with_type(line.msg_type.clone())),
+                HashMap::new(),
+            )),
             _ => None,
         }
         .unwrap_or_else(|| (content, None, HashMap::new()));
@@ -1219,7 +1259,7 @@ impl Matcher {
             extractor,
             extract_ids,
             names,
-            skip_resource: true,
+            skip_resource: false,
         }) as Box<dyn MsgMatcher>)
     }
 }
