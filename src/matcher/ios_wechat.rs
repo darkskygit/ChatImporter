@@ -162,6 +162,32 @@ struct RecordLine {
 }
 
 impl RecordLine {
+    pub fn get_attach_hashs(
+        &self,
+        backup: &Backup,
+        account: &str,
+        hashed_user: &str,
+    ) -> HashMap<i64, String> {
+        backup
+            .find_regex_paths(
+                DOMAIN,
+                &format!(
+                    "^Documents/{}/(Audio|Img|OpenData|Video)/{}/{}[\\./]",
+                    account, hashed_user, self.local_id
+                ),
+            )
+            .iter()
+            .filter_map(|file| {
+                backup
+                    .read_file(file)
+                    .map(|data| (data, file.relative_filename.clone()))
+                    .map_err(|e| error!("Failed to read attach: {}, {}", file.relative_filename, e))
+                    .ok()
+            })
+            .map(|(data, path)| (Blob::new(data).hash, path))
+            .collect()
+    }
+
     pub fn get_audio_metadata(&self) -> AttachMetadata {
         lazy_static! {
             static ref CLIENT_ID_MATCH: Regex =
@@ -892,6 +918,7 @@ impl UserDB {
         line: &RecordLine,
         contact: &Contact,
     ) -> Result<RecordType, String> {
+        const CHECK_ATTACHS: bool = false;
         let is_group = contact.name.ends_with("@chatroom");
         let (sender_id, sender_name, content) = {
             if line.is_dest {
@@ -1058,6 +1085,24 @@ impl UserDB {
             _ => None,
         }
         .unwrap_or_else(|| (content, None, HashMap::new()));
+
+        if CHECK_ATTACHS {
+            use std::collections::HashSet;
+            let loaded_hashs = attach
+                .values()
+                .map(|data| Blob::new(data.clone()).hash)
+                .collect::<HashSet<_>>();
+            for (hash, path) in
+                line.get_attach_hashs(backup, &self.account, &gen_md5(&contact.name))
+            {
+                if loaded_hashs.get(&hash).is_none() && !path.ends_with(".video_thum") {
+                    warn!(
+                        "Hash {} not exists: {}, {} | {} | {:?}",
+                        hash, path, line.local_id, line.created_time, line.msg_type
+                    )
+                }
+            }
+        }
 
         let record = Record {
             chat_type: "WeChat".into(),
