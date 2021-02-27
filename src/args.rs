@@ -1,10 +1,29 @@
 use lazy_static::*;
+use log::Level;
 use path_absolutize::Absolutize;
 use path_ext::PathExt;
 use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
 use structopt::StructOpt;
 use walkdir::WalkDir;
+
+#[derive(StructOpt, Debug, Clone)]
+pub struct Verbosity {
+    #[structopt(long = "verbosity", short = "v", parse(from_occurrences))]
+    verbosity: u8,
+}
+
+impl Verbosity {
+    pub fn log_level(&self) -> Level {
+        match self.verbosity {
+            0 => Level::Error,
+            1 => Level::Warn,
+            2 => Level::Info,
+            3 => Level::Debug,
+            _ => Level::Trace,
+        }
+    }
+}
 
 #[derive(StructOpt)]
 pub enum SubCommand {
@@ -33,6 +52,8 @@ pub enum SubCommand {
 
 #[derive(StructOpt)]
 struct Args {
+    #[structopt(flatten)]
+    pub verbosity: Verbosity,
     #[structopt(subcommand)]
     cmd: SubCommand,
 }
@@ -56,6 +77,9 @@ impl Args {
                 .collect(),
         }
     }
+    fn get_log_level(&self) -> Level {
+        self.verbosity.log_level()
+    }
 }
 
 fn check_path<S: AsRef<str>>(src: S) -> Result<PathBuf, Error> {
@@ -73,6 +97,10 @@ fn check_path<S: AsRef<str>>(src: S) -> Result<PathBuf, Error> {
 
 lazy_static! {
     static ref ARGS: Args = Args::from_args();
+}
+
+pub fn get_log_level() -> Level {
+    ARGS.get_log_level()
 }
 
 pub fn get_paths() -> Vec<PathBuf> {
