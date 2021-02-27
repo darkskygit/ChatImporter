@@ -12,6 +12,9 @@ use regex::{Captures, Regex};
 
 pub trait MsgMatcher {
     fn get_records(&self) -> Option<Vec<RecordType>>;
+    fn get_metadata_merger(&self) -> Option<Box<dyn Fn(Vec<u8>, Vec<u8>) -> Option<Vec<u8>>>> {
+        None
+    }
 }
 
 use anyhow::{Context, Result};
@@ -59,7 +62,10 @@ where
             );
             sw = Instant::now();
         }
-        if !recorder.insert_or_update_record(record.clone())? {
+        if !recorder
+            .insert_or_update_record(record.clone(), matcher.get_metadata_merger())
+            .context(format!("Cannot insert records: {}", record.display()))?
+        {
             let content = record
                 .get_record()
                 .map(|r| r.content.clone())

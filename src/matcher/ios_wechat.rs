@@ -1309,6 +1309,10 @@ impl Matcher {
     }
 }
 
+fn merge_metadata(_old: Vec<u8>, new: Vec<u8>) -> Option<Vec<u8>> {
+    Some(new) // TODO
+}
+
 impl MsgMatcher for Matcher {
     fn get_records(&self) -> Option<Vec<RecordType>> {
         Some(
@@ -1326,5 +1330,9 @@ impl MsgMatcher for Matcher {
                 })
                 .collect(),
         )
+    }
+
+    fn get_metadata_merger(&self) -> Option<Box<dyn Fn(Vec<u8>, Vec<u8>) -> Option<Vec<u8>>>> {
+        Some(Box::new(merge_metadata))
     }
 }
