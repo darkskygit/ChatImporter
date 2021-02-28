@@ -4,8 +4,8 @@ use ibackuptool2::{Backup, BackupFile};
 use num_enum::TryFromPrimitive;
 use plist::Value;
 use rusqlite::{params, Connection, OpenFlags, Result as SqliteResult};
-use serde::Serialize;
-use serde_json::to_vec;
+use serde::{Deserialize, Serialize};
+use serde_json::{from_slice, to_vec};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Error, ErrorKind, Write};
@@ -65,7 +65,108 @@ impl Contact {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, TryFromPrimitive)]
+enum MMType {
+    Vec(Vec<u8>),
+    String(String),
+    SubString(String),
+}
+
+impl MMType {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::String(s) | Self::SubString(s) => s,
+            _ => "",
+        }
+    }
+}
+
+struct MMMap {
+    data: Vec<u8>,
+    pos: usize,
+}
+
+impl MMMap {
+    fn to_map(data: &[u8], len: Option<usize>) -> HashMap<String, MMType> {
+        Self::new(data, len).into_map()
+    }
+
+    fn new(data: &[u8], len: Option<usize>) -> Self {
+        Self {
+            data: data[..len.unwrap_or(data.len())].into(),
+            pos: 8,
+        }
+    }
+
+    fn into_map(mut self) -> HashMap<String, MMType> {
+        let mut map = HashMap::new();
+        while let Some(k) = self.next() {
+            if let MMType::String(key) = k {
+                if let Some(val) = self.next() {
+                    map.insert(key, val);
+                }
+            }
+        }
+        map
+    }
+
+    fn parse_pos(orig_data: &[u8], pos: usize) -> (usize, usize) {
+        let size = orig_data[pos];
+        if size & 0x80 == 0 {
+            (size as usize, 1)
+        } else {
+            let splited_data = &orig_data[pos..];
+            let len = splited_data.iter().take_while(|&u| u & 128 != 0).count() + 1;
+            let len = if len >= 4 {
+                4
+            } else if len <= 0 {
+                return (0, 0);
+            } else {
+                len
+            };
+            let splited_size = &splited_data[..len];
+            let mut size: usize = 0;
+            for (i, c) in splited_size.iter().enumerate() {
+                let shift = i * 7;
+                if c & 128 != 0 {
+                    // More bytes are present
+                    size |= (*c as usize & 127) << shift;
+                } else {
+                    size |= (*c as usize) << shift;
+                }
+            }
+
+            (size.into(), splited_size.len())
+        }
+    }
+}
+
+impl Iterator for MMMap {
+    type Item = MMType;
+    fn next(&mut self) -> Option<Self::Item> {
+        let (size, pos_len) = Self::parse_pos(&self.data, self.pos);
+        self.pos += pos_len;
+        (self.pos + size < self.data.len()).then(|| {
+            let slice = &self.data[self.pos..self.pos + size];
+            self.pos += size;
+
+            let (sub_size, sub_pos_len) = Self::parse_pos(slice, 0);
+            (sub_size > 0 && sub_pos_len + sub_size <= slice.len())
+                .then(|| {
+                    from_utf8(&slice[sub_pos_len..sub_pos_len + sub_size])
+                        .map(|s| MMType::SubString(s.into()))
+                        .or_else(|_| from_utf8(slice).map(|s| MMType::String(s.into())))
+                        .unwrap_or_else(|_| MMType::Vec(slice.into()))
+                })
+                .unwrap_or_else(|| {
+                    from_utf8(slice)
+                        .map(|s| MMType::String(s.into()))
+                        .unwrap_or_else(|_| MMType::Vec(slice.into()))
+                })
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TryFromPrimitive)]
 #[repr(u32)]
 enum MsgType {
     Normal = 1,        // 文字/emoji
@@ -89,7 +190,7 @@ impl Default for MsgType {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 enum MetadataType {
     Int(i64),
@@ -107,7 +208,7 @@ impl MetadataType {
     }
 }
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct AttachMetadata {
     mtype: MsgType,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -574,6 +675,7 @@ struct UserDB {
     contact: Option<Arc<NamedTempFile>>,
     message: Option<Arc<NamedTempFile>>,
     setting: Option<BackupFile>,
+    kv_setting: Option<BackupFile>,
     session: Option<Arc<NamedTempFile>>,
     account_files: HashMap<String, BackupFile>,
     chats: HashMap<String, String>,
@@ -632,6 +734,8 @@ impl UserDB {
             }
         } else if filename == "mmsetting.archive" {
             self.setting = Some(file.clone());
+        } else if filename.starts_with("mmsetting.archive.") {
+            self.kv_setting = Some(file.clone())
         }
         self
     }
@@ -639,14 +743,15 @@ impl UserDB {
     pub fn is_complete(&self) -> bool {
         let ret = self.contact.is_some()
             && self.message.is_some()
-            && self.setting.is_some()
+            && (self.setting.is_some() || self.kv_setting.is_some())
             && self.session.is_some();
         if !ret {
             warn!(
-                "user db lost some metadata: {}, {}, {}, {}",
+                "user db lost some metadata: {}, {}, {}, {}, {}",
                 self.contact.is_some(),
                 self.message.is_some(),
                 self.setting.is_some(),
+                self.kv_setting.is_some(),
                 self.session.is_some()
             );
         }
@@ -698,6 +803,17 @@ impl UserDB {
             } else {
                 warn!("failed to load settings: {}", setting.relative_filename);
             }
+        }
+        if let Some(setting) = &self.kv_setting {
+            let data = backup.read_file(setting)?;
+            let map = MMMap::to_map(&data, None);
+            self.wxid = map.get("86").map(MMType::as_str).unwrap_or_default().into();
+            self.name = map.get("88").map(MMType::as_str).unwrap_or_default().into();
+            self.head = map
+                .get("headimgurl")
+                .map(MMType::as_str)
+                .unwrap_or_default()
+                .into();
         }
         Ok(())
     }
@@ -1231,17 +1347,30 @@ impl Extractor {
             backup.find_wildcard_paths(DOMAIN, "*/WCDB_Contact.sqlite"),
             backup.find_wildcard_paths(DOMAIN, "*/MM.sqlite"),
             backup.find_wildcard_paths(DOMAIN, "*/mmsetting.archive"),
+            backup.find_wildcard_paths(DOMAIN, "*/mmsetting.archive.*"),
             backup.find_wildcard_paths(DOMAIN, "*/session/session.db"),
         ];
         for file in paths.iter().flatten() {
             let path = Path::new(&file.relative_filename);
-            if MATCHED_NAME.contains(&path.name_str()) {
-                if let Some(user_id) = path
+            if MATCHED_NAME.contains(&path.name_str())
+                || path.name_str().starts_with(MATCHED_NAME[2])
+            {
+                if let Some(mut user_id) = path
                     .strip_prefix("Documents")
                     .ok()
                     .and_then(|p| p.components().next())
                     .map(|user_id| user_id.name_str().to_string())
                 {
+                    if user_id == "MMappedKV" {
+                        user_id = if path.ext_str() == "crc" {
+                            gen_md5(path.with_extension("").ext_str())
+                        } else {
+                            gen_md5(path.ext_str())
+                        };
+                        if user_id == "d41d8cd98f00b204e9800998ecf8427e" {
+                            continue;
+                        }
+                    }
                     if let Some(user) = user_map.remove(&user_id) {
                         let user: UserDB = user;
                         user_map.insert(user_id, user.with(&backup, file));

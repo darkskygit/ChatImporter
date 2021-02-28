@@ -163,7 +163,7 @@ impl KeyBag {
 
         // 1. Round of pbkdf2-sha256(passcode)
         pbkdf2::derive(
-            pbkdf2::PBKDF2_HMAC_SHA1,
+            pbkdf2::PBKDF2_HMAC_SHA256,
             std::num::NonZeroU32::new(dpic as u32).unwrap(),
             &double_protection_salt.as_slice(),
             passcode.as_bytes(),
