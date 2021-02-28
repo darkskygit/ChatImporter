@@ -673,7 +673,7 @@ impl RecordLine {
 #[derive(Clone, Default)]
 struct UserDB {
     contact: Option<Arc<NamedTempFile>>,
-    message: Option<Arc<NamedTempFile>>,
+    messages: Vec<Arc<NamedTempFile>>,
     setting: Option<BackupFile>,
     kv_setting: Option<BackupFile>,
     session: Option<Arc<NamedTempFile>>,
@@ -710,8 +710,13 @@ impl UserDB {
     }
 
     fn match_path(mut self, backup: &Backup, file: &BackupFile) -> Self {
+        lazy_static! {
+            static ref MESSAGES: Regex = Regex::new(r"^message_\d+.sqlite$").unwrap();
+        }
         let filename = Path::new(&file.relative_filename).name_str().to_string();
-        if ["WCDB_Contact.sqlite", "MM.sqlite", "session.db"].contains(&filename.as_str()) {
+        if ["WCDB_Contact.sqlite", "MM.sqlite", "session.db"].contains(&filename.as_str())
+            || MESSAGES.is_match(&filename)
+        {
             if let Ok(tmpfile) = NamedTempFile::new().and_then(|mut tmpfile| {
                 debug!(
                     "read file: {}, {}, {}",
@@ -725,8 +730,9 @@ impl UserDB {
             }) {
                 match filename.as_str() {
                     "WCDB_Contact.sqlite" => self.contact = Some(Arc::new(tmpfile)),
-                    "MM.sqlite" => self.message = Some(Arc::new(tmpfile)),
+                    "MM.sqlite" => self.messages.push(Arc::new(tmpfile)),
                     "session.db" => self.session = Some(Arc::new(tmpfile)),
+                    _ if filename.starts_with("message_") => self.messages.push(Arc::new(tmpfile)),
                     _ => {}
                 }
             } else {
@@ -742,14 +748,14 @@ impl UserDB {
 
     pub fn is_complete(&self) -> bool {
         let ret = self.contact.is_some()
-            && self.message.is_some()
+            && !self.messages.is_empty()
             && (self.setting.is_some() || self.kv_setting.is_some())
             && self.session.is_some();
         if !ret {
             warn!(
                 "user db lost some metadata: {}, {}, {}, {}, {}",
                 self.contact.is_some(),
-                self.message.is_some(),
+                !self.messages.is_empty(),
                 self.setting.is_some(),
                 self.kv_setting.is_some(),
                 self.session.is_some()
@@ -832,23 +838,26 @@ impl UserDB {
     }
 
     fn load_chats(&mut self) -> SqliteResult<()> {
-        if let Some(conn) = Self::get_conn(self.message.clone())? {
-            let contact_keys = self.contacts.keys().map(|s| s.as_str()).collect::<Vec<_>>();
-            self.chats = conn
-                .prepare(r#"SELECT name FROM sqlite_master where type='table' and name like "Chat\_%" ESCAPE '\'"#)?
-                .query_map(params![], |row| {
-                    let name: String = row.get(0)?;
-                    let hash = &name[5..];
-                    if !contact_keys.iter().any(|&i| i == hash) && hash != self.account {
-                        warn!("Contact info for chat not exists: {}", hash);
-                    }
-                    Ok((hash.into(), name))
-                })?
-                .filter_map(|r| {
-                    r.map_err(|e| warn!("failed to parse chat list: {}", e))
-                        .ok()
-                })
-                .collect();
+        for message in self.messages.iter() {
+            if let Some(conn) = Self::get_conn(Some(message.clone()))? {
+                let contact_keys = self.contacts.keys().map(|s| s.as_str()).collect::<Vec<_>>();
+                let chats = conn
+                        .prepare(r#"SELECT name FROM sqlite_master where type='table' and name like "Chat\_%" ESCAPE '\'"#)?
+                        .query_map(params![], |row| {
+                            let name: String = row.get(0)?;
+                            let hash = &name[5..];
+                            if !contact_keys.iter().any(|&i| i == hash) && hash != self.account {
+                                warn!("Contact info for chat not exists: {}", hash);
+                            }
+                            Ok((hash.into(), name))
+                        })?
+                        .filter_map(|r| {
+                            r.map_err(|e| warn!("failed to parse chat list: {}", e))
+                                .ok()
+                        })
+                        .collect::<HashMap<_, _>>();
+                self.chats = self.chats.clone().into_iter().chain(chats).collect();
+            }
         }
         Ok(())
     }
@@ -919,56 +928,86 @@ impl UserDB {
             .collect()
     }
 
+    fn find_chat_table(&self, hash: &str) -> Vec<Arc<NamedTempFile>> {
+        let query = format!(
+            r#"SELECT name FROM sqlite_master where type='table' and name like "Chat\_{}" ESCAPE '\'"#,
+            hash
+        );
+        self.messages
+            .iter()
+            .filter(|&file| {
+                Self::get_conn(Some(file.clone()))
+                    .and_then(|conn| {
+                        if let Some(conn) = conn {
+                            conn.prepare(&query)?.exists(params![])
+                        } else {
+                            Err(rusqlite::Error::InvalidQuery)
+                        }
+                    })
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+
     fn load_record_lines<S: ToString>(
         &self,
         user_name: S,
         skip_resource: bool,
     ) -> SqliteResult<Vec<RecordLine>> {
-        if let Some(conn) = Self::get_conn(self.message.clone())? {
-            let user_name = user_name.to_string();
-            Ok(conn
-                .prepare(&format!(
-                    "SELECT
-                        MesLocalID,
-                        MesSvrID,
-                        CreateTime,
-                        Message,
-                        Status,
-                        ImgStatus,
-                        Type,
-                        Des
-                    FROM
-                        Chat_{}",
-                    self.chats
-                        .keys()
-                        .find(|h| h.as_str() == user_name)
-                        .map(|s| s.into())
-                        .unwrap_or_else(|| gen_md5(user_name))
-                ))?
-                .query_map(params![], |row| {
-                    Ok(RecordLine {
-                        local_id: row.get(0)?,
-                        server_id: row.get(1)?,
-                        created_time: row.get(2)?,
-                        message: row.get(3)?,
-                        status: row.get(4)?,
-                        image_status: row.get(5)?,
-                        msg_type: MsgType::try_from(row.get::<_, u32>(6)?).unwrap_or_else(|t| {
-                            warn!("unknown type: {}", t);
-                            MsgType::Unknown
-                        }),
-                        is_dest: row.get(7)?,
-                        skip_resource,
-                    })
-                })?
-                .filter_map(|r| {
-                    r.map_err(|e| warn!("failed to parse chat line: {}", e))
-                        .ok()
-                })
-                .collect())
-        } else {
-            Ok(vec![])
+        let mut lines = vec![];
+        let user_name = user_name.to_string();
+        let hash = self
+            .chats
+            .keys()
+            .find(|h| h.as_str() == user_name)
+            .map(|s| s.into())
+            .unwrap_or_else(|| gen_md5(user_name));
+        for message in self.find_chat_table(&hash) {
+            if let Some(conn) = Self::get_conn(Some(message.clone()))? {
+                lines.append(
+                    &mut conn
+                        .prepare(&format!(
+                            "SELECT
+                            MesLocalID,
+                            MesSvrID,
+                            CreateTime,
+                            Message,
+                            Status,
+                            ImgStatus,
+                            Type,
+                            Des
+                        FROM
+                            Chat_{}",
+                            hash
+                        ))?
+                        .query_map(params![], |row| {
+                            Ok(RecordLine {
+                                local_id: row.get(0)?,
+                                server_id: row.get(1)?,
+                                created_time: row.get(2)?,
+                                message: row.get(3)?,
+                                status: row.get(4)?,
+                                image_status: row.get(5)?,
+                                msg_type: MsgType::try_from(row.get::<_, u32>(6)?).unwrap_or_else(
+                                    |t| {
+                                        warn!("unknown type: {}", t);
+                                        MsgType::Unknown
+                                    },
+                                ),
+                                is_dest: row.get(7)?,
+                                skip_resource,
+                            })
+                        })?
+                        .filter_map(|r| {
+                            r.map_err(|e| warn!("failed to parse chat line: {}", e))
+                                .ok()
+                        })
+                        .collect(),
+                );
+            }
         }
+        Ok(lines)
     }
 
     fn get_from_user_id(&self, content: &str) -> Option<(String, String)> {
@@ -1336,9 +1375,10 @@ impl Extractor {
     }
 
     fn get_user_info(backup: &Backup) -> HashMap<String, UserDB> {
-        const MATCHED_NAME: [&str; 4] = [
+        const MATCHED_NAME: [&str; 5] = [
             "WCDB_Contact.sqlite",
             "MM.sqlite",
+            "message_",
             "mmsetting.archive",
             "session.db",
         ];
@@ -1346,6 +1386,7 @@ impl Extractor {
         let paths = vec![
             backup.find_wildcard_paths(DOMAIN, "*/WCDB_Contact.sqlite"),
             backup.find_wildcard_paths(DOMAIN, "*/MM.sqlite"),
+            backup.find_wildcard_paths(DOMAIN, "*/message_*.sqlite"),
             backup.find_wildcard_paths(DOMAIN, "*/mmsetting.archive"),
             backup.find_wildcard_paths(DOMAIN, "*/mmsetting.archive.*"),
             backup.find_wildcard_paths(DOMAIN, "*/session/session.db"),
@@ -1354,6 +1395,7 @@ impl Extractor {
             let path = Path::new(&file.relative_filename);
             if MATCHED_NAME.contains(&path.name_str())
                 || path.name_str().starts_with(MATCHED_NAME[2])
+                || path.name_str().starts_with(MATCHED_NAME[3])
             {
                 if let Some(mut user_id) = path
                     .strip_prefix("Documents")
