@@ -774,10 +774,21 @@ impl UserDB {
     fn load_settings(&mut self, backup: &Backup) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(setting) = &self.setting {
             let data = backup.read_file(setting)?;
-            if let Some(array) = Value::from_reader(Cursor::new(data))?
+            if let Some(array) = Value::from_reader(Cursor::new(data))
+                .map_err(|e| {
+                    warn!(
+                        "failed to load settings: {}, {}",
+                        setting.relative_filename, e
+                    )
+                })
+                .ok()
+                .and_then(|plist| {
+                    plist
                 .as_dictionary()
                 .and_then(|dict| dict.get("$objects"))
                 .and_then(|obj| obj.as_array())
+                        .map(|a| a.clone())
+                })
             {
                 if array.len() > 3 {
                     self.wxid = array[2]
@@ -807,7 +818,10 @@ impl UserDB {
                     .to_string();
                 }
             } else {
-                warn!("failed to load settings: {}", setting.relative_filename);
+                warn!(
+                    "failed to load settings: {}, {}",
+                    setting.relative_filename, "array not exists"
+                );
             }
         }
         if let Some(setting) = &self.kv_setting {
