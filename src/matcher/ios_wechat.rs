@@ -143,9 +143,10 @@ impl MMMap {
 impl Iterator for MMMap {
     type Item = MMType;
     fn next(&mut self) -> Option<Self::Item> {
+        if self.data.len() > self.pos {
         let (size, pos_len) = Self::parse_pos(&self.data, self.pos);
         self.pos += pos_len;
-        (self.pos + size < self.data.len()).then(|| {
+            (size > 0 && self.pos + size < self.data.len()).then(|| {
             let slice = &self.data[self.pos..self.pos + size];
             self.pos += size;
 
@@ -163,6 +164,9 @@ impl Iterator for MMMap {
                         .unwrap_or_else(|_| MMType::Vec(slice.into()))
                 })
         })
+        } else {
+            None
+        }
     }
 }
 
@@ -211,7 +215,7 @@ impl MetadataType {
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct AttachMetadata {
     mtype: MsgType,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     hash: HashMap<String, MetadataType>,
 }
 
