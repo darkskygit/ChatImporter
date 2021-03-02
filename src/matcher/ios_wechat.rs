@@ -848,13 +848,30 @@ impl UserDB {
         if let Some(setting) = &self.kv_setting {
             let data = backup.read_file(setting)?;
             let map = MMMap::to_map(&data, None);
-            self.wxid = map.get("86").map(MMType::as_str).unwrap_or_default().into();
-            self.name = map.get("88").map(MMType::as_str).unwrap_or_default().into();
-            self.head = map
-                .get("headimgurl")
+            self.wxid = if self.wxid.is_empty() {
+                map.get("86").map(MMType::as_str).unwrap_or_default().into()
+            } else {
+                self.wxid.clone()
+            };
+            self.name = if self.name.is_empty() {
+                map.get("88").map(MMType::as_str).unwrap_or_default().into()
+            } else {
+                self.name.clone()
+            };
+            self.head = if self.head.is_empty() {
+                map.get("headimgurl")
                 .map(MMType::as_str)
                 .unwrap_or_default()
-                .into();
+                    .into()
+            } else {
+                self.head.clone()
+            };
+        }
+        if self.wxid.is_empty() || self.name.is_empty() || self.head.is_empty() {
+            warn!(
+                r#"lost some account info: "{}", "{}", "{}""#,
+                self.wxid, self.name, self.head
+            );
         }
         Ok(())
     }
