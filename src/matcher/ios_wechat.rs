@@ -173,18 +173,20 @@ impl Iterator for MMMap {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TryFromPrimitive)]
 #[repr(u32)]
 enum MsgType {
-    Normal = 1,        // 文字/emoji
-    Image = 3,         // 图片
-    Voice = 34,        // 语音
-    ContactShare = 42, // 联系人分享
-    Video = 43,        // 视频
-    BigEmoji = 47,     // 大表情
-    Location = 48,     // 定位
-    CustomApp = 49,    // 文件、分享、转账、聊天记录批量转发
-    VoipContent = 50,  // 语音/视频通话？
-    ShortVideo = 62,   // 短视频？
-    System = 10000,    // 系统信息，入群/群改名/他人撤回信息/红包领取提醒等等
-    Revoke = 10002,    // 撤回信息修改
+    Normal = 1,              // 文字/emoji
+    Image = 3,               // 图片
+    Voice = 34,              // 语音
+    ContactShare = 42,       // 联系人分享
+    Video = 43,              // 视频
+    BigEmoji = 47,           // 大表情
+    Location = 48,           // 定位
+    CustomApp = 49,          // 文件、分享、转账、聊天记录批量转发
+    VoipContent = 50,        // 语音/视频通话？
+    ShortVideo = 62,         // 短视频？
+    VoipStatus = 64,         // 语音通话状态
+    WeWorkContactShare = 66, // 企业微信联系人分享
+    System = 10000,          // 系统信息，入群/群改名/他人撤回信息/红包领取提醒等等
+    Revoke = 10002,          // 撤回信息修改
     Unknown = u32::MAX,
 }
 
@@ -368,6 +370,8 @@ impl RecordLine {
             static ref USERNAME_MATCH: Regex = Regex::new(r#"username\s*?=\s*?"(.*?)""#).unwrap();
             static ref CITY_MATCH: Regex = Regex::new(r#"city\s*?=\s*?"(.*?)""#).unwrap();
             static ref PROVINCE_MATCH: Regex = Regex::new(r#"province\s*?=\s*?"(.*?)""#).unwrap();
+            static ref OPENIMDESC_MATCH: Regex =
+                Regex::new(r#"openimdesc\s*?=\s*?"(.*?)""#).unwrap();
             static ref BIG_IMG_MATCH: Regex =
                 Regex::new(r#"bigheadimgurl\s*?=\s*?"(.*?)""#).unwrap();
             static ref SMALL_IMG_MATCH: Regex =
@@ -378,6 +382,7 @@ impl RecordLine {
             self.get_match_string(&*USERNAME_MATCH, "username"),
             self.get_match_string(&*CITY_MATCH, "city"),
             self.get_match_string(&*PROVINCE_MATCH, "province"),
+            self.get_match_string(&*OPENIMDESC_MATCH, "openimdesc"),
             self.get_match_string(&*BIG_IMG_MATCH, "head")
                 .or_else(|| self.get_match_string(&*SMALL_IMG_MATCH, "head")),
         ]
@@ -529,6 +534,18 @@ impl RecordLine {
             }),
             |metadata, (k, v)| metadata.with_tag(k.to_string(), v.into()),
         )
+    }
+
+    pub fn get_voip_status(&self) -> AttachMetadata {
+        lazy_static! {
+            static ref CONTENT_MATCH: Regex = Regex::new(r#"msgContent\s*?=\s*?"(.*?)""#).unwrap();
+        }
+        [self.get_match_string(&*CONTENT_MATCH, "content")]
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .fold(AttachMetadata::new(), |metadata, (k, v)| {
+                metadata.with_tag(k.to_string(), v.into())
+            })
     }
 
     pub fn get_revoke(&self) -> AttachMetadata {
@@ -1102,6 +1119,7 @@ impl UserDB {
                         MsgType::BigEmoji,
                         MsgType::CustomApp,
                         MsgType::Video,
+                        MsgType::VoipStatus,
                         MsgType::System,
                         MsgType::Revoke,
                     ]
@@ -1213,7 +1231,7 @@ impl UserDB {
                 Some(line.get_emoji().with_type(line.msg_type.clone())),
                 HashMap::new(),
             )),
-            MsgType::ContactShare => Some((
+            MsgType::ContactShare | MsgType::WeWorkContactShare => Some((
                 "[contact]".into(),
                 Some(line.get_contact().with_type(line.msg_type.clone())),
                 HashMap::new(),
@@ -1239,6 +1257,11 @@ impl UserDB {
                         .with_tag("type".into(), line.message.clone())
                         .with_type(line.msg_type.clone()),
                 ),
+                HashMap::new(),
+            )),
+            MsgType::VoipStatus => Some((
+                "[voip]".into(),
+                Some(line.get_voip_status().with_type(line.msg_type.clone())),
                 HashMap::new(),
             )),
             MsgType::System => Some((

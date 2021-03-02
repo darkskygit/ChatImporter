@@ -9,6 +9,7 @@ pub use info::BackupInfo;
 pub use manifest::{BackupManifest, BackupManifestLockdown};
 pub use status::BackupStatus;
 
+use std::cmp::min;
 use std::convert::TryFrom;
 use std::fs::{read, write};
 use std::path::{Path, PathBuf};
@@ -139,8 +140,9 @@ impl Backup {
                 Some(fileinfo) => match fileinfo.encryption_key.as_ref() {
                     Some(encryption_key) => {
                         let dec = decrypt_with_key(&encryption_key, &contents);
+                        let sliced_dec = dec[..min(fileinfo.size as usize, dec.len())].to_vec();
                         debug!("file {} is now decrypted...", finpath.display());
-                        return Ok(dec);
+                        return Ok(sliced_dec);
                     }
                     None => {
                         return Err(BackupError::NoEncryptionKey.into());
