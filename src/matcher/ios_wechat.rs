@@ -144,26 +144,26 @@ impl Iterator for MMMap {
     type Item = MMType;
     fn next(&mut self) -> Option<Self::Item> {
         if self.data.len() > self.pos {
-        let (size, pos_len) = Self::parse_pos(&self.data, self.pos);
-        self.pos += pos_len;
+            let (size, pos_len) = Self::parse_pos(&self.data, self.pos);
+            self.pos += pos_len;
             (size > 0 && self.pos + size < self.data.len()).then(|| {
-            let slice = &self.data[self.pos..self.pos + size];
-            self.pos += size;
+                let slice = &self.data[self.pos..self.pos + size];
+                self.pos += size;
 
-            let (sub_size, sub_pos_len) = Self::parse_pos(slice, 0);
-            (sub_size > 0 && sub_pos_len + sub_size <= slice.len())
-                .then(|| {
-                    from_utf8(&slice[sub_pos_len..sub_pos_len + sub_size])
-                        .map(|s| MMType::SubString(s.into()))
-                        .or_else(|_| from_utf8(slice).map(|s| MMType::String(s.into())))
-                        .unwrap_or_else(|_| MMType::Vec(slice.into()))
-                })
-                .unwrap_or_else(|| {
-                    from_utf8(slice)
-                        .map(|s| MMType::String(s.into()))
-                        .unwrap_or_else(|_| MMType::Vec(slice.into()))
-                })
-        })
+                let (sub_size, sub_pos_len) = Self::parse_pos(slice, 0);
+                (sub_size > 0 && sub_pos_len + sub_size <= slice.len())
+                    .then(|| {
+                        from_utf8(&slice[sub_pos_len..sub_pos_len + sub_size])
+                            .map(|s| MMType::SubString(s.into()))
+                            .or_else(|_| from_utf8(slice).map(|s| MMType::String(s.into())))
+                            .unwrap_or_else(|_| MMType::Vec(slice.into()))
+                    })
+                    .unwrap_or_else(|| {
+                        from_utf8(slice)
+                            .map(|s| MMType::String(s.into()))
+                            .unwrap_or_else(|_| MMType::Vec(slice.into()))
+                    })
+            })
         } else {
             None
         }
@@ -227,6 +227,35 @@ impl AttachMetadata {
             hash: HashMap::new(),
             ..Default::default()
         }
+    }
+
+    pub fn into_map(self) -> HashMap<String, MetadataType> {
+        self.hash
+    }
+
+    fn hash_differ(
+        old_hash: &HashMap<String, MetadataType>,
+        new_hash: &HashMap<String, MetadataType>,
+    ) {
+        const CHECK_DIFFERENCE: bool = true;
+        if CHECK_DIFFERENCE {
+            for (key, (old, new)) in old_hash.keys().filter_map(|key| {
+                old_hash.get(key).and_then(|val| {
+                    new_hash
+                        .get(key)
+                        .and_then(|new_val| (val != new_val).then_some((key, (val, new_val))))
+                })
+            }) {
+                warn!(r#"metadata override "{}": "{:?}" -> "{:?}""#, key, old, new);
+            }
+        }
+    }
+
+    pub fn merge(self, old: Self) -> Self {
+        let old_hash = old.into_map();
+        let hash = old_hash.clone().into_iter().chain(self.hash).collect();
+        Self::hash_differ(&old_hash, &hash);
+        Self { hash, ..self }
     }
 
     pub fn with_hash(mut self, name: String, hash: i64) -> Self {
@@ -805,9 +834,9 @@ impl UserDB {
                 .ok()
                 .and_then(|plist| {
                     plist
-                .as_dictionary()
-                .and_then(|dict| dict.get("$objects"))
-                .and_then(|obj| obj.as_array())
+                        .as_dictionary()
+                        .and_then(|dict| dict.get("$objects"))
+                        .and_then(|obj| obj.as_array())
                         .map(|a| a.clone())
                 })
             {
@@ -860,8 +889,8 @@ impl UserDB {
             };
             self.head = if self.head.is_empty() {
                 map.get("headimgurl")
-                .map(MMType::as_str)
-                .unwrap_or_default()
+                    .map(MMType::as_str)
+                    .unwrap_or_default()
                     .into()
             } else {
                 self.head.clone()
@@ -1427,7 +1456,19 @@ struct Extractor {
 impl Extractor {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let mut backup = Backup::new(path)?;
-        backup.parse_manifest()?;
+        if backup.manifest.is_encrypted {
+            backup.parse_keybag()?;
+            debug!("trying decrypt of backup keybag");
+            if let Some(ref mut kb) = backup.manifest.keybag.as_mut() {
+                let pass = rpassword::read_password_from_tty(Some("Backup Password: "))?;
+                kb.unlock_with_passcode(&pass);
+            }
+            backup.manifest.unlock_manifest();
+            backup.parse_manifest()?;
+            backup.unwrap_file_keys()?;
+        } else {
+            backup.parse_manifest()?;
+        }
         let user_info = Self::get_user_info(&backup);
         Ok(Self { backup, user_info })
     }
@@ -1538,8 +1579,22 @@ impl Matcher {
     }
 }
 
-fn merge_metadata(_old: Vec<u8>, new: Vec<u8>) -> Option<Vec<u8>> {
-    Some(new) // TODO
+fn merge_metadata(old: Vec<u8>, new: Vec<u8>) -> Option<Vec<u8>> {
+    if let Ok((old, new)) = from_slice(&old)
+        .map_err(|e| error!("Failed to parse old metadata: {}", e))
+        .and_then(|old| {
+            from_slice::<AttachMetadata>(&new)
+                // 新元数据是即时生成的，不应该解析错误
+                .map_err(|e| panic!("Failed to parse new metadata: {}", e))
+                .map(|new| (old, new))
+        })
+    {
+        to_vec(&new.merge(old))
+            .map_err(|e| error!("Failed to serialize metadata: {}", e))
+            .ok()
+    } else {
+        Some(new)
+    }
 }
 
 impl MsgMatcher for Matcher {
