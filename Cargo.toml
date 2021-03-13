@@ -11,7 +11,7 @@ base64 = "0.13.0"
 binread = "1.1.1"
 chrono = "0.4.15"
 fern = "0.6.0"
-gchdb = "0.2.2"
+gchdb = "0.2.6"
 hex = "0.4.2"
 htmlescape = "0.3.1"
 lazy_static = "1.4.0"
@@ -32,6 +32,11 @@ walkdir = "2.3.1"
 
 [dependencies.ibackuptool2]
 path = "lib/ibackuptool2"
+
+[dependencies.image]
+version = "0.23.13"
+default-features = false
+features = ["bmp", "jpeg", "jpeg_rayon", "png"]
 
 [dependencies.log]
 version = "0.4.11"

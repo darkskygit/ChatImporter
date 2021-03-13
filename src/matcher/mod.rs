@@ -1,18 +1,22 @@
 mod ios_sms;
 mod ios_wechat;
+mod utils;
 mod win_qq_html;
 mod win_qq_mht;
 
-use gchdb::{Blob, Record, RecordType};
+use gchdb::{Attachments, Blob, MetadataMerger, Record, RecordType};
 use htmlescape::decode_html;
 use lazy_static::lazy_static;
 pub use log::{debug, error, info, warn};
 use path_ext::PathExt;
 use regex::{Captures, Regex};
+use utils::{blob_dhash, hamming_distance};
+
+type SqliteMetadataMerger = MetadataMerger<SqliteChatRecorder>;
 
 pub trait MsgMatcher {
     fn get_records(&self) -> Option<Vec<RecordType>>;
-    fn get_metadata_merger(&self) -> Option<Box<dyn Fn(Vec<u8>, Vec<u8>) -> Option<Vec<u8>>>> {
+    fn get_metadata_merger(&self) -> Option<SqliteMetadataMerger> {
         None
     }
 }

@@ -233,7 +233,50 @@ impl AttachMetadata {
         self.hash
     }
 
-    fn hash_differ(
+    fn thum_checker(
+        recorder: &SqliteChatRecorder,
+        attachs: &Attachments,
+        target: Vec<&i64>,
+        thum: &i64,
+    ) -> bool {
+        let target = target
+            .iter()
+            .filter_map(|&hash| {
+                recorder
+                    .get_blob(*hash)
+                    .and_then(|blob| {
+                        Ok(blob_dhash(&blob)
+                            .context(format!("Failed to decode image: {}", hash))?)
+                    })
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        (target.len() > 0)
+            .then(|| {
+                attachs
+                    .get(&thum.to_string())
+                    .and_then(|blob| {
+                        blob_dhash(blob)
+                            .map_err(|e| warn!("Failed to decode image: {}, {}", thum, e))
+                            .ok()
+                    })
+                    .and_then(|thum_hash| {
+                        target
+                            .into_iter()
+                            .find(|hash| hamming_distance(*hash, thum_hash) <= 5)
+                            .or_else(|| {
+                                warn!("Failed to find similar image: {}", thum);
+                                None
+                            })
+                    })
+                    .is_none()
+            })
+            .unwrap_or(true)
+    }
+
+    fn hash_checker(
+        recorder: &SqliteChatRecorder,
+        attachs: &Attachments,
         old_hash: &HashMap<String, MetadataType>,
         new_hash: &HashMap<String, MetadataType>,
     ) {
@@ -246,15 +289,34 @@ impl AttachMetadata {
                         .and_then(|new_val| (val != new_val).then_some((key, (val, new_val))))
                 })
             }) {
+                if let ("thum", MetadataType::Int(thum)) = (key.as_str(), new) {
+                    let mut target = match (new_hash.get("img"), new_hash.get("hd")) {
+                        (Some(MetadataType::Int(img)), Some(MetadataType::Int(hd))) => {
+                            vec![img, hd]
+                        }
+                        (Some(MetadataType::Int(img)), None) => vec![img],
+                        (None, Some(MetadataType::Int(hd))) => vec![hd],
+                        _ => vec![],
+                    };
+                    if let MetadataType::Int(old) = old {
+                        // 迁移记录可能重新生成缩略图
+                        // 因此把旧缩略图也加入对比
+                        target.push(old);
+                    }
+                    if !Self::thum_checker(recorder, attachs, target, thum) {
+                        // 存在相似高清图时跳过waring
+                        continue;
+                    }
+                }
                 warn!(r#"metadata override "{}": "{:?}" -> "{:?}""#, key, old, new);
             }
         }
     }
 
-    pub fn merge(self, old: Self) -> Self {
+    pub fn merge(self, recorder: &SqliteChatRecorder, attachs: &Attachments, old: Self) -> Self {
         let old_hash = old.into_map();
         let hash = old_hash.clone().into_iter().chain(self.hash).collect();
-        Self::hash_differ(&old_hash, &hash);
+        Self::hash_checker(recorder, attachs, &old_hash, &hash);
         Self { hash, ..self }
     }
 
@@ -291,7 +353,7 @@ struct RecordLine {
     created_time: i64,
     message: String,
     status: u8,
-    image_status: u8,
+    image_status: u16,
     msg_type: MsgType,
     is_dest: bool,
     skip_resource: bool,
@@ -386,7 +448,7 @@ impl RecordLine {
         backups: &HashMap<String, BackupFile>,
         account: &str,
         hashed_user: &str,
-    ) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)> {
+    ) -> Option<(AttachMetadata, Attachments)> {
         let (ftype, dir, ext) = ("voice", "Audio", "aud");
         Self::get_files(vec![self
             .get_file(backup, backups, account, hashed_user, ftype, dir, ext)
@@ -427,7 +489,7 @@ impl RecordLine {
         backup: &Backup,
         account: &str,
         hashed_user: &str,
-    ) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)> {
+    ) -> Option<(AttachMetadata, Attachments)> {
         lazy_static! {
             static ref TITLE_MATCH: Regex = Regex::new(r"<title>(.*?)</title>").unwrap();
             static ref TITLE_CDATA_MATCH: Regex =
@@ -529,7 +591,7 @@ impl RecordLine {
         backups: &HashMap<String, BackupFile>,
         account: &str,
         hashed_user: &str,
-    ) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)> {
+    ) -> Option<(AttachMetadata, Attachments)> {
         Self::get_files(vec![
             self.get_image_thum(backup, backups, account, hashed_user),
             self.get_image_small(backup, backups, account, hashed_user),
@@ -600,7 +662,7 @@ impl RecordLine {
         backups: &HashMap<String, BackupFile>,
         account: &str,
         hashed_user: &str,
-    ) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)> {
+    ) -> Option<(AttachMetadata, Attachments)> {
         let (ftype, dir, ext) = ("video", "Video", "mp4");
         Self::get_files(vec![self
             .get_file(backup, backups, account, hashed_user, ftype, dir, ext)
@@ -643,7 +705,7 @@ impl RecordLine {
             .map(|(metadata, data)| (ftype.into(), metadata, data))
     }
 
-    fn get_files<I>(iter: I) -> Option<(AttachMetadata, HashMap<String, Vec<u8>>)>
+    fn get_files<I>(iter: I) -> Option<(AttachMetadata, Attachments)>
     where
         I: IntoIterator<Item = Option<(String, AttachMetadata, Vec<u8>)>>,
     {
@@ -803,7 +865,10 @@ impl UserDB {
             && self.session.is_some();
         if !ret {
             warn!(
-                "user db lost some metadata: {}, {}, {}, {}, {}",
+                "user {} ({}, {}) db lost some metadata: {}, {}, {}, {}, {}",
+                self.account,
+                self.wxid,
+                self.name,
                 self.contact.is_some(),
                 !self.messages.is_empty(),
                 self.setting.is_some(),
@@ -1579,17 +1644,23 @@ impl Matcher {
     }
 }
 
-fn merge_metadata(old: Vec<u8>, new: Vec<u8>) -> Option<Vec<u8>> {
+fn merge_metadata(
+    recorder: &SqliteChatRecorder,
+    attachs: &Attachments,
+    old: Vec<u8>,
+    new: Vec<u8>,
+) -> Option<Vec<u8>> {
     if let Ok((old, new)) = from_slice(&old)
         .map_err(|e| error!("Failed to parse old metadata: {}", e))
         .and_then(|old| {
+            // 调用前已做判断，metadata必为非空
             from_slice::<AttachMetadata>(&new)
                 // 新元数据是即时生成的，不应该解析错误
                 .map_err(|e| panic!("Failed to parse new metadata: {}", e))
                 .map(|new| (old, new))
         })
     {
-        to_vec(&new.merge(old))
+        to_vec(&new.merge(recorder, attachs, old))
             .map_err(|e| error!("Failed to serialize metadata: {}", e))
             .ok()
     } else {
@@ -1616,7 +1687,7 @@ impl MsgMatcher for Matcher {
         )
     }
 
-    fn get_metadata_merger(&self) -> Option<Box<dyn Fn(Vec<u8>, Vec<u8>) -> Option<Vec<u8>>>> {
-        Some(Box::new(merge_metadata))
+    fn get_metadata_merger(&self) -> Option<SqliteMetadataMerger> {
+        Some(merge_metadata)
     }
 }
