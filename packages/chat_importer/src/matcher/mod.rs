@@ -4,6 +4,7 @@ mod utils;
 mod win_qq_html;
 mod win_qq_mht;
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use gchdb::{Attachments, Blob, MetadataMerger, Record, RecordType};
 use htmlescape::decode_html;
 use lazy_static::lazy_static;
@@ -88,7 +89,7 @@ fn gen_md5<S: ToString>(user_name: S) -> String {
 
 fn hex2b64(hex: &str) -> String {
     hex::decode(&hex)
-        .map(base64::encode)
+        .map(|h| STANDARD.encode(&h))
         .unwrap_or_else(|_| hex.into())
 }
 

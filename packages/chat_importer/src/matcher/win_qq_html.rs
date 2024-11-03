@@ -312,7 +312,7 @@ impl Extractor {
                                 sender_id,
                                 sender_name,
                                 content: msg.content,
-                                timestamp: date.and_time(time).timestamp_millis(),
+                                timestamp: date.and_time(time).and_utc().timestamp_millis(),
                                 metadata: Some(metadata),
                                 ..Default::default()
                             },
@@ -333,7 +333,7 @@ impl Extractor {
                         sender_id,
                         sender_name,
                         content: msg.content,
-                        timestamp: date.and_time(time).timestamp_millis(),
+                        timestamp: date.and_time(time).and_utc().timestamp_millis(),
                         ..Default::default()
                     }))
                 }

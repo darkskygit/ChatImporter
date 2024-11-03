@@ -1411,6 +1411,14 @@ impl UserDB {
             }
         }
 
+        fn get_microsecond(server_id: i64) -> i64 {
+            use mur3::Hasher32;
+            use std::hash::Hasher;
+            let mut hasher = Hasher32::with_seed(42);
+            hasher.write(&server_id.to_be_bytes());
+            (((hasher.finish32() as u64) * 1000) / u32::MAX as u64) as i64
+        }
+
         let record = Record {
             chat_type: "WeChat".into(),
             owner_id: self.wxid.clone(),
@@ -1418,7 +1426,7 @@ impl UserDB {
             sender_id,
             sender_name,
             content,
-            timestamp: line.created_time * 1000,
+            timestamp: line.created_time * 1000 + get_microsecond(line.server_id),
             metadata: metadata.as_ref().and_then(|m| {
                 to_vec(m)
                     .map_err(|e| warn!("failed to serialization metadata: {}", e))
@@ -1444,23 +1452,8 @@ impl UserDB {
             .iter()
             .fold(Vec::<RecordType>::new(), |mut ret, curr| {
                 match self.transform_record_line(backup, curr, contact) {
-                    Ok(record_type) => record_type
-                        .get_record()
-                        .and_then(|record| {
-                            modify_timestamp(
-                                record_type.clone(),
-                                ret.iter()
-                                    .filter_map(|r| r.get_record())
-                                    .filter(|r| {
-                                        i64::abs(r.timestamp - record.timestamp) < 1000
-                                            && r.sender_id == record.sender_id
-                                    })
-                                    .map(|r| r.timestamp)
-                                    .max(),
-                            )
-                        })
-                        .map(|record| ret.push(record)),
-                    Err(e) => Some(error!("failed to transfrom record line: {}", e)),
+                    Ok(record_type) => ret.push(record_type),
+                    Err(e) => error!("failed to transform record line: {}", e),
                 };
                 ret
             })
@@ -1525,7 +1518,7 @@ impl Extractor {
             backup.parse_keybag()?;
             debug!("trying decrypt of backup keybag");
             if let Some(ref mut kb) = backup.manifest.keybag.as_mut() {
-                let pass = rpassword::read_password_from_tty(Some("Backup Password: "))?;
+                let pass = rpassword::prompt_password("Backup Password: ")?;
                 kb.unlock_with_passcode(&pass);
             }
             backup.manifest.unlock_manifest();
