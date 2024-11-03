@@ -1213,6 +1213,14 @@ impl UserDB {
             })
     }
 
+    fn get_microsecond(server_id: i64) -> i64 {
+        use mur3::Hasher128;
+        use std::hash::Hasher;
+        let mut hasher = Hasher128::with_seed(42);
+        hasher.write(&server_id.to_be_bytes());
+        (((hasher.finish() as u128) * 1000) / u32::MAX as u128) as i64
+    }
+
     fn transform_record_line(
         &self,
         backup: &Backup,
@@ -1411,14 +1419,6 @@ impl UserDB {
             }
         }
 
-        fn get_microsecond(server_id: i64) -> i64 {
-            use mur3::Hasher32;
-            use std::hash::Hasher;
-            let mut hasher = Hasher32::with_seed(42);
-            hasher.write(&server_id.to_be_bytes());
-            (((hasher.finish32() as u64) * 1000) / u32::MAX as u64) as i64
-        }
-
         let record = Record {
             chat_type: "WeChat".into(),
             owner_id: self.wxid.clone(),
@@ -1426,7 +1426,7 @@ impl UserDB {
             sender_id,
             sender_name,
             content,
-            timestamp: line.created_time * 1000 + get_microsecond(line.server_id),
+            timestamp: line.created_time * 1000 + Self::get_microsecond(line.server_id),
             metadata: metadata.as_ref().and_then(|m| {
                 to_vec(m)
                     .map_err(|e| warn!("failed to serialization metadata: {}", e))
