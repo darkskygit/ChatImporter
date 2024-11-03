@@ -16,7 +16,7 @@ impl Matcher {
     ) -> Result<Box<dyn MsgMatcher>, MailParseError> {
         info!("Parsing mht...");
         let mht = parse_mail(data)?;
-        let attachs = mht
+        let attaches = mht
             .subparts
             .iter()
             .filter_map(|part| {
@@ -31,10 +31,10 @@ impl Matcher {
                     .and_then(|name| part.get_body_raw().map(|data| (name.clone(), data)).ok())
             })
             .collect::<HashMap<_, _>>();
-        attachs
+        attaches
             .get("__main__")
             .and_then(|data| String::from_utf8(data.clone()).ok())
-            .map(|html| Extractor::new(html, owner, file_name, AttachGetter::new(attachs.clone())))
+            .map(|html| Extractor::new(html, owner, file_name, AttachGetter::new(attaches.clone())))
             .map(|qq_html_matcher| Box::new(Self { qq_html_matcher }) as Box<dyn MsgMatcher>)
             .ok_or(MailParseError::Generic("test"))
     }
@@ -47,12 +47,12 @@ impl MsgMatcher for Matcher {
 }
 
 struct AttachGetter {
-    attachs: HashMap<String, Vec<u8>>,
+    attaches: HashMap<String, Vec<u8>>,
 }
 
 impl AttachGetter {
-    pub fn new(attachs: HashMap<String, Vec<u8>>) -> Self {
-        Self { attachs }
+    pub fn new(attaches: HashMap<String, Vec<u8>>) -> Self {
+        Self { attaches }
     }
 }
 
@@ -63,7 +63,7 @@ impl QQAttachGetter for AttachGetter {
             .and_then(|s| s.to_str())
             .unwrap_or(path)
             .to_string();
-        self.attachs
+        self.attaches
             .get(&name)
             .map(|data| QQMsgImage::Attach {
                 data: data.clone(),

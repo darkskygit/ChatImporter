@@ -235,7 +235,7 @@ impl AttachMetadata {
 
     fn thum_checker(
         recorder: &SqliteChatRecorder,
-        attachs: &Attachments,
+        attaches: &Attachments,
         target: Vec<&i64>,
         thum: &i64,
     ) -> bool {
@@ -253,7 +253,7 @@ impl AttachMetadata {
             .collect::<Vec<_>>();
         (target.len() > 0)
             .then(|| {
-                attachs
+                attaches
                     .get(&thum.to_string())
                     .and_then(|blob| {
                         blob_dhash(blob)
@@ -276,7 +276,7 @@ impl AttachMetadata {
 
     fn hash_checker(
         recorder: &SqliteChatRecorder,
-        attachs: &Attachments,
+        attaches: &Attachments,
         old_hash: &HashMap<String, MetadataType>,
         new_hash: &HashMap<String, MetadataType>,
     ) {
@@ -303,7 +303,7 @@ impl AttachMetadata {
                         // 因此把旧缩略图也加入对比
                         target.push(old);
                     }
-                    if !Self::thum_checker(recorder, attachs, target, thum) {
+                    if !Self::thum_checker(recorder, attaches, target, thum) {
                         // 存在相似高清图时跳过waring
                         continue;
                     }
@@ -313,10 +313,10 @@ impl AttachMetadata {
         }
     }
 
-    pub fn merge(self, recorder: &SqliteChatRecorder, attachs: &Attachments, old: Self) -> Self {
+    pub fn merge(self, recorder: &SqliteChatRecorder, attaches: &Attachments, old: Self) -> Self {
         let old_hash = old.into_map();
         let hash = old_hash.clone().into_iter().chain(self.hash).collect();
-        Self::hash_checker(recorder, attachs, &old_hash, &hash);
+        Self::hash_checker(recorder, attaches, &old_hash, &hash);
         Self { hash, ..self }
     }
 
@@ -340,8 +340,8 @@ impl AttachMetadata {
         self
     }
 
-    pub fn with_type(mut self, mtype: MsgType) -> Self {
-        self.mtype = mtype;
+    pub fn with_type(mut self, msg_type: MsgType) -> Self {
+        self.mtype = msg_type;
         self
     }
 }
@@ -1213,13 +1213,13 @@ impl UserDB {
             })
     }
 
-    fn transfrom_record_line(
+    fn transform_record_line(
         &self,
         backup: &Backup,
         line: &RecordLine,
         contact: &Contact,
     ) -> Result<RecordType, String> {
-        const CHECK_ATTACHS: bool = false;
+        const CHECK_ATTACHES: bool = false;
         let is_group = contact.name.ends_with("@chatroom");
         let (sender_id, sender_name, content) = {
             if line.is_dest {
@@ -1393,7 +1393,7 @@ impl UserDB {
         }
         .unwrap_or_else(|| (content, None, HashMap::new()));
 
-        if CHECK_ATTACHS {
+        if CHECK_ATTACHES {
             use std::collections::HashSet;
             let loaded_hashs = attach
                 .values()
@@ -1434,7 +1434,7 @@ impl UserDB {
         })
     }
 
-    fn transfrom_record_lines(
+    fn transform_record_lines(
         &self,
         backup: &Backup,
         contact: &Contact,
@@ -1443,7 +1443,7 @@ impl UserDB {
         lines
             .iter()
             .fold(Vec::<RecordType>::new(), |mut ret, curr| {
-                match self.transfrom_record_line(backup, curr, contact) {
+                match self.transform_record_line(backup, curr, contact) {
                     Ok(record_type) => record_type
                         .get_record()
                         .and_then(|record| {
@@ -1481,7 +1481,7 @@ impl UserDB {
             })
             .and_then(|contact| {
                 self.load_record_lines(&chat_id, skip_resource)
-                    .map(|lines| self.transfrom_record_lines(backup, contact, lines))
+                    .map(|lines| self.transform_record_lines(backup, contact, lines))
                     .map_err(|e| warn!("failed to get chat line: {}", e))
                     .ok()
             })
@@ -1646,7 +1646,7 @@ impl Matcher {
 
 fn merge_metadata(
     recorder: &SqliteChatRecorder,
-    attachs: &Attachments,
+    attaches: &Attachments,
     old: Vec<u8>,
     new: Vec<u8>,
 ) -> Option<Vec<u8>> {
@@ -1660,7 +1660,7 @@ fn merge_metadata(
                 .map(|new| (old, new))
         })
     {
-        to_vec(&new.merge(recorder, attachs, old))
+        to_vec(&new.merge(recorder, attaches, old))
             .map_err(|e| error!("Failed to serialize metadata: {}", e))
             .ok()
     } else {
