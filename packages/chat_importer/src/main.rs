@@ -1,5 +1,3 @@
-#![feature(bool_to_option)]
-
 mod args;
 mod logger;
 mod matcher;
@@ -65,7 +63,7 @@ fn test_load_blobs() {
         .unwrap();
     for (idx, item) in array.iter().enumerate() {
         let old: Vec<u8> = command
-            .query_map(vec![item.old.clone()], |row| row.get(0))
+            .query_map([item.old.clone()], |row| row.get(0))
             .unwrap()
             .next()
             .unwrap()
@@ -76,7 +74,7 @@ fn test_load_blobs() {
         )
         .unwrap();
         let new: Vec<u8> = command
-            .query_map(vec![item.new.clone()], |row| row.get(0))
+            .query_map([item.new.clone()], |row| row.get(0))
             .unwrap()
             .next()
             .unwrap()

@@ -1,5 +1,5 @@
 use super::{address::Contact, *};
-use rusqlite::{Connection, NO_PARAMS};
+use rusqlite::Connection;
 use std::io::Write;
 
 use chrono::prelude::DateTime;
@@ -65,7 +65,7 @@ pub fn find_person(conn: &Connection, handle_id: u32) -> Option<Sender> {
         .prepare("SELECT ROWID, id, country, service from handle WHERE ROWID = $1")
         .unwrap();
     let mut person_iter = persion_stmt
-        .query_map(vec![handle_id], |row| {
+        .query_map([handle_id], |row| {
             Ok(Sender {
                 rowid: row.get(0)?,
                 id: row.get(1)?,
@@ -87,7 +87,7 @@ pub fn find_person(conn: &Connection, handle_id: u32) -> Option<Sender> {
 pub fn find_message(conn: &Connection, message_id: u32) -> Message {
     let mut persion_stmt = conn.prepare("SELECT ROWID, handle_id, text, date, date_read, date_delivered, is_from_me from message WHERE ROWID = $1").unwrap();
     let mut person_iter = persion_stmt
-        .query_map(vec![message_id], |row| {
+        .query_map([message_id], |row| {
             let sender_id: u32 = row.get(1)?;
             let sender = find_person(conn, sender_id);
             Ok(Message {
@@ -111,7 +111,7 @@ pub fn find_people(conn: &Connection, chatid: u32) -> Vec<Sender> {
         .unwrap();
 
     let handle_id_iter = stmt
-        .query_map(vec![chatid], |row| {
+        .query_map([chatid], |row| {
             let handle_id: u32 = row.get(0)?;
             Ok(handle_id)
         })
@@ -137,7 +137,7 @@ pub fn find_messages(conn: &Connection, chatid: u32) -> Vec<Message> {
         .unwrap();
 
     let message_id_iter = stmt
-        .query_map(vec![chatid], |row| {
+        .query_map([chatid], |row| {
             let message_id: u32 = row.get(1)?;
             Ok(message_id)
         })
@@ -156,7 +156,7 @@ pub fn read_chats(conn: &Connection) -> Vec<Conversation> {
         .prepare("SELECT rowid, guid, chat_identifier, display_name, group_id FROM chat")
         .unwrap();
     let chat_iter = stmt
-        .query_map(NO_PARAMS, |row| {
+        .query_map([], |row| {
             let chat_id: u32 = row.get(0)?;
             Ok(Conversation {
                 id: chat_id,

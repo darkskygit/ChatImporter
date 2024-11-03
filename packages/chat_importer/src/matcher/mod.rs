@@ -22,7 +22,7 @@ pub trait MsgMatcher {
 }
 
 use anyhow::{Context, Result};
-use gchdb::{ChatRecoder, SqliteChatRecorder};
+use gchdb::{ChatRecorder, SqliteChatRecorder};
 use std::fs::read;
 use std::path::Path;
 use std::time::Instant;
@@ -104,19 +104,19 @@ fn modify_timestamp(record_type: RecordType, near_sec: Option<i64>) -> Option<Re
                 timestamp: max(near_sec, record.timestamp) + 1,
                 ..record.clone()
             })),
-            RecordType::RecordWithAttachs { record, attachs } => Some(RecordType::from((
+            RecordType::RecordWithAttaches { record, attaches } => Some(RecordType::from((
                 Record {
                     timestamp: max(near_sec, record.timestamp) + 1,
                     ..record
                 },
-                attachs,
+                attaches,
             ))),
-            RecordType::RecordRefWithAttachs { record, attachs } => Some(RecordType::from((
+            RecordType::RecordRefWithAttaches { record, attaches } => Some(RecordType::from((
                 Record {
                     timestamp: max(near_sec, record.timestamp) + 1,
                     ..record.clone()
                 },
-                attachs,
+                attaches,
             ))),
             _ => None,
         }

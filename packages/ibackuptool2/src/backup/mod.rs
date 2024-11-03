@@ -14,8 +14,7 @@ use std::convert::TryFrom;
 use std::fs::{read, write};
 use std::path::{Path, PathBuf};
 
-use rusqlite::OpenFlags;
-use rusqlite::{Connection, NO_PARAMS};
+use rusqlite::{Connection, OpenFlags};
 
 #[derive(Debug)]
 pub struct Backup {
@@ -212,7 +211,7 @@ impl Backup {
 
         let mut stmt =
             conn.prepare("SELECT fileid, domain, relativePath, flags, file from Files")?;
-        let rows = stmt.query_map(NO_PARAMS, |row| {
+        let rows = stmt.query_map([], |row| {
             // fileid equals sha1(format!("{}-{}", domain, relative_filename))
             let fileid: String = row.get(0)?;
             let domain: String = row.get(1)?;

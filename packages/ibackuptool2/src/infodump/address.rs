@@ -1,5 +1,5 @@
 use super::*;
-use rusqlite::{Connection, NO_PARAMS};
+use rusqlite::Connection;
 use std::collections::HashMap;
 
 pub type Phone = String;
@@ -300,7 +300,7 @@ pub fn load_address_book(conn: &Connection) -> Result<AddressBook, Box<dyn std::
         .prepare("SELECT ROWID, First, Middle, Last from ABPerson")
         .unwrap();
 
-    let contact_iter = stmt.query_map(NO_PARAMS, |row| {
+    let contact_iter = stmt.query_map([], |row| {
         let rowid: u32 = row.get(0)?;
 
         Ok(Contact {
@@ -335,7 +335,7 @@ pub fn find_listed_properties(
 ) -> Result<Vec<(PropertyType, PropertyLabel, String)>, Box<dyn std::error::Error>> {
     let mut stmt = conn.prepare("SELECT ROWID, identifier, property, label, value, guid from ABMultiValue WHERE  record_id = $1")?;
 
-    let value_iter = stmt.query_map(vec![record_id], |row| {
+    let value_iter = stmt.query_map([record_id], |row| {
         // let rowid : u32 = row.get(0)?;
         // let identifier : i64 = row.get(1)?;
         let property: Option<i64> = row.get(2)?;
