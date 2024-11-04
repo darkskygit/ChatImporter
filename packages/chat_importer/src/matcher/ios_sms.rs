@@ -187,8 +187,8 @@ fn test_ios_sms_db() -> SqliteResult<()> {
             .collect::<Vec<_>>()
             .join(",")
     );
-    for recoder in matcher.get_record_lines(0)? {
-        println!("{:?}", recoder);
+    for recorder in matcher.get_record_lines(0)? {
+        println!("{:?}", recorder);
     }
     Ok(())
 }

@@ -109,7 +109,7 @@ impl TryFrom<::plist::Value> for FileInfo {
         let fork = plist::decode_nskeyedarchiver(value);
 
         if let Value::Dictionary(mut forkdict) = fork {
-            // Unwrap contained binaryy data / attributes
+            // Unwrap contained binary data / attributes
             let val = forkdict.remove("EncryptionKey");
             if let Some(Value::Dictionary(dict)) = val {
                 if let Some(Value::Data(data)) = dict.get("NS.data") {
@@ -124,8 +124,8 @@ impl TryFrom<::plist::Value> for FileInfo {
                 }
             }
 
-            let exta = forkdict.remove("ExtendedAttributes");
-            if let Some(Value::Dictionary(dict)) = exta {
+            let extra = forkdict.remove("ExtendedAttributes");
+            if let Some(Value::Dictionary(dict)) = extra {
                 if let Some(Value::Data(data)) = dict.get("NS.data") {
                     forkdict.insert("ExtendedAttributes".to_string(), Value::Data(data.to_vec()));
                 }

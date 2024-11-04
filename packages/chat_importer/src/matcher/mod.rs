@@ -1,5 +1,5 @@
 mod ios_sms;
-mod ios_wechat;
+mod ios_wc;
 mod utils;
 mod win_qq_html;
 mod win_qq_mht;
@@ -49,7 +49,7 @@ where
                 .unwrap_or_default()
                 .into(),
         )?,
-        ExportType::iOSWeChat(path, names) => ios_wechat::Matcher::new(path, names)?,
+        ExportType::iOSWeChat(path, names) => ios_wc::Matcher::new(path, names)?,
         ExportType::iOSSMS(path, owner) => ios_sms::Matcher::new(path, owner)?,
     };
     let records = matcher.get_records().context("Cannot transfrom records")?;

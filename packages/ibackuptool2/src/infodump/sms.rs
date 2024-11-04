@@ -104,14 +104,14 @@ pub fn find_message(conn: &Connection, message_id: u32) -> Message {
 
     person_iter.next().expect("message to be there").unwrap()
 }
-pub fn find_people(conn: &Connection, chatid: u32) -> Vec<Sender> {
+pub fn find_people(conn: &Connection, chat_id: u32) -> Vec<Sender> {
     let mut out: Vec<Sender> = vec![];
     let mut stmt = conn
         .prepare("SELECT handle_id FROM chat_handle_join WHERE chat_id = $1")
         .unwrap();
 
     let handle_id_iter = stmt
-        .query_map([chatid], |row| {
+        .query_map([chat_id], |row| {
             let handle_id: u32 = row.get(0)?;
             Ok(handle_id)
         })
@@ -128,7 +128,7 @@ pub fn find_people(conn: &Connection, chatid: u32) -> Vec<Sender> {
     out
 }
 
-pub fn find_messages(conn: &Connection, chatid: u32) -> Vec<Message> {
+pub fn find_messages(conn: &Connection, chat_id: u32) -> Vec<Message> {
     let mut out: Vec<Message> = vec![];
     let mut stmt = conn
         .prepare(
@@ -137,7 +137,7 @@ pub fn find_messages(conn: &Connection, chatid: u32) -> Vec<Message> {
         .unwrap();
 
     let message_id_iter = stmt
-        .query_map([chatid], |row| {
+        .query_map([chat_id], |row| {
             let message_id: u32 = row.get(1)?;
             Ok(message_id)
         })

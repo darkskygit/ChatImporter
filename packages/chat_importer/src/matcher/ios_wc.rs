@@ -114,8 +114,8 @@ impl MMMap {
         if size & 0x80 == 0 {
             (size as usize, 1)
         } else {
-            let splited_data = &orig_data[pos..];
-            let len = splited_data.iter().take_while(|&u| u & 128 != 0).count() + 1;
+            let splitted_data = &orig_data[pos..];
+            let len = splitted_data.iter().take_while(|&u| u & 128 != 0).count() + 1;
             let len = if len >= 4 {
                 4
             } else if len <= 0 {
@@ -123,9 +123,9 @@ impl MMMap {
             } else {
                 len
             };
-            let splited_size = &splited_data[..len];
+            let splitted_size = &splitted_data[..len];
             let mut size: usize = 0;
-            for (i, c) in splited_size.iter().enumerate() {
+            for (i, c) in splitted_size.iter().enumerate() {
                 let shift = i * 7;
                 if c & 128 != 0 {
                     // More bytes are present
@@ -135,7 +135,7 @@ impl MMMap {
                 }
             }
 
-            (size.into(), splited_size.len())
+            (size.into(), splitted_size.len())
         }
     }
 }
