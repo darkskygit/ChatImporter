@@ -32,7 +32,7 @@ impl SqliteProxy {
         file.unwrap_file_key(backup);
         let mut tmpfile = tempfile::NamedTempFile::new()?;
 
-        tmpfile.write(backup.read_file(&file).expect("read to succeed").as_slice())?;
+        tmpfile.write_all(backup.read_file(&file).expect("read to succeed").as_slice())?;
 
         let connection = Connection::open(tmpfile.path())?;
 

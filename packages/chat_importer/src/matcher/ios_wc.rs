@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Error, ErrorKind, Write};
 use std::iter::IntoIterator;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::str::{from_utf8, Utf8Error};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
@@ -118,7 +119,7 @@ impl MMMap {
             let len = splitted_data.iter().take_while(|&u| u & 128 != 0).count() + 1;
             let len = if len >= 4 {
                 4
-            } else if len <= 0 {
+            } else if len == 0 {
                 return (0, 0);
             } else {
                 len
@@ -199,17 +200,15 @@ impl Default for MsgType {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 enum MetadataType {
-    Int(i64),
     Float(f64),
     Str(String),
 }
 
 impl MetadataType {
-    pub fn get_hash(&self) -> i64 {
-        if let Self::Int(ref i) = self {
-            *i
-        } else {
-            0
+    pub fn get_hash(&self) -> Option<&str> {
+        match self {
+            Self::Str(value) => Some(value),
+            _ => None,
         }
     }
 }
@@ -233,28 +232,35 @@ impl AttachMetadata {
         self.hash
     }
 
-    fn thum_checker(
-        recorder: &SqliteChatRecorder,
+    async fn thum_checker(
+        store: &ChatStore,
         attaches: &Attachments,
-        target: Vec<&i64>,
-        thum: &i64,
+        target: Vec<&str>,
+        thum: &str,
     ) -> bool {
-        let target = target
-            .iter()
-            .filter_map(|&hash| {
-                recorder
-                    .get_blob(*hash)
-                    .and_then(|blob| {
-                        Ok(blob_dhash(&blob)
-                            .context(format!("Failed to decode image: {}", hash))?)
-                    })
-                    .ok()
-            })
-            .collect::<Vec<_>>();
+        let mut target_hashes = Vec::new();
+        for hash in target {
+            if let Some(blob) = attaches.get(hash) {
+                if let Ok(dhash) =
+                    blob_dhash(blob).context(format!("Failed to decode image: {}", hash))
+                {
+                    target_hashes.push(dhash);
+                }
+            } else if let Ok(hash32) = Hash32::from_hex(hash) {
+                if let Ok(Some(blob)) = store.get_asset(hash32).await {
+                    if let Ok(dhash) =
+                        blob_dhash(&blob).context(format!("Failed to decode image: {}", hash))
+                    {
+                        target_hashes.push(dhash);
+                    }
+                }
+            }
+        }
+        let target = target_hashes;
         (target.len() > 0)
             .then(|| {
                 attaches
-                    .get(&thum.to_string())
+                    .get(thum)
                     .and_then(|blob| {
                         blob_dhash(blob)
                             .map_err(|e| warn!("Failed to decode image: {}, {}", thum, e))
@@ -274,8 +280,8 @@ impl AttachMetadata {
             .unwrap_or(true)
     }
 
-    fn hash_checker(
-        recorder: &SqliteChatRecorder,
+    async fn hash_checker(
+        store: &ChatStore,
         attaches: &Attachments,
         old_hash: &HashMap<String, MetadataType>,
         new_hash: &HashMap<String, MetadataType>,
@@ -289,22 +295,19 @@ impl AttachMetadata {
                         .and_then(|new_val| (val != new_val).then_some((key, (val, new_val))))
                 })
             }) {
-                if let ("thum", MetadataType::Int(thum)) = (key.as_str(), new) {
+                if let ("thum", MetadataType::Str(thum)) = (key.as_str(), new) {
                     let mut target = match (new_hash.get("img"), new_hash.get("hd")) {
-                        (Some(MetadataType::Int(img)), Some(MetadataType::Int(hd))) => {
-                            vec![img, hd]
+                        (Some(MetadataType::Str(img)), Some(MetadataType::Str(hd))) => {
+                            vec![img.as_str(), hd.as_str()]
                         }
-                        (Some(MetadataType::Int(img)), None) => vec![img],
-                        (None, Some(MetadataType::Int(hd))) => vec![hd],
+                        (Some(MetadataType::Str(img)), None) => vec![img.as_str()],
+                        (None, Some(MetadataType::Str(hd))) => vec![hd.as_str()],
                         _ => vec![],
                     };
-                    if let MetadataType::Int(old) = old {
-                        // 迁移记录可能重新生成缩略图
-                        // 因此把旧缩略图也加入对比
-                        target.push(old);
+                    if let MetadataType::Str(old) = old {
+                        target.push(old.as_str());
                     }
-                    if !Self::thum_checker(recorder, attaches, target, thum) {
-                        // 存在相似高清图时跳过waring
+                    if !Self::thum_checker(store, attaches, target, thum).await {
                         continue;
                     }
                 }
@@ -313,15 +316,15 @@ impl AttachMetadata {
         }
     }
 
-    pub fn merge(self, recorder: &SqliteChatRecorder, attaches: &Attachments, old: Self) -> Self {
+    pub async fn merge(self, store: &ChatStore, attaches: &Attachments, old: Self) -> Self {
         let old_hash = old.into_map();
         let hash = old_hash.clone().into_iter().chain(self.hash).collect();
-        Self::hash_checker(recorder, attaches, &old_hash, &hash);
+        Self::hash_checker(store, attaches, &old_hash, &hash).await;
         Self { hash, ..self }
     }
 
-    pub fn with_hash(mut self, name: String, hash: i64) -> Self {
-        self.hash.insert(name, MetadataType::Int(hash));
+    pub fn with_hash(mut self, name: String, hash: String) -> Self {
+        self.hash.insert(name, MetadataType::Str(hash));
         self
     }
 
@@ -365,7 +368,7 @@ impl RecordLine {
         backup: &Backup,
         account: &str,
         hashed_user: &str,
-    ) -> HashMap<i64, String> {
+    ) -> HashMap<String, String> {
         backup
             .find_regex_paths(
                 DOMAIN,
@@ -382,7 +385,7 @@ impl RecordLine {
                     .map_err(|e| error!("Failed to read attach: {}, {}", file.relative_filename, e))
                     .ok()
             })
-            .map(|(data, path)| (Blob::new(data).hash, path))
+            .map(|(data, path)| (Hash32::sha3_256(&data).to_hex(), path))
             .collect()
     }
 
@@ -557,7 +560,7 @@ impl RecordLine {
         });
         Some((
             files.iter().fold(metadata, |metadata, (name, data)| {
-                metadata.with_hash(format!("attach:{}", name), Blob::new(data.clone()).hash)
+                metadata.with_hash(format!("attach:{}", name), Hash32::sha3_256(data).to_hex())
             }),
             files,
         ))
@@ -718,13 +721,14 @@ impl RecordLine {
                     .get(&ftype)
                     .map(|hash| (ftype, hash.clone(), data))
             })
-            .fold(
+            .try_fold(
                 (AttachMetadata::new(), HashMap::new()),
                 |(metadata, mut map), (ftype, hash, data)| {
-                    map.insert(hash.get_hash().to_string(), data.clone());
-                    (metadata.with_hash(ftype, hash.get_hash()), map)
+                    let hash = hash.get_hash()?;
+                    map.insert(hash.to_string(), data.clone());
+                    Some((metadata.with_hash(ftype, hash.to_string()), map))
                 },
-            );
+            )?;
         (!map.is_empty() && !metadata.hash.is_empty()).then_some((metadata, map))
     }
 
@@ -767,7 +771,7 @@ impl RecordLine {
                 .map(|data| {
                     (
                         AttachMetadata::new()
-                            .with_hash(file_type.into(), Blob::new(data.clone()).hash),
+                            .with_hash(file_type.into(), Hash32::sha3_256(&data).to_hex()),
                         data,
                     )
                 })
@@ -859,21 +863,22 @@ impl UserDB {
     }
 
     pub fn is_complete(&self) -> bool {
-        let ret = self.contact.is_some()
-            && !self.messages.is_empty()
-            && (self.setting.is_some() || self.kv_setting.is_some())
-            && self.session.is_some();
+        let has_contact = self.contact.is_some();
+        let has_messages = !self.messages.is_empty();
+        let has_setting = self.setting.is_some() || self.kv_setting.is_some();
+        let has_session = self.session.is_some();
+        let ret = has_contact && has_messages && has_setting && has_session;
         if !ret {
             warn!(
-                "user {} ({}, {}) db lost some metadata: {}, {}, {}, {}, {}",
+                "user db incomplete: account={}, wxid={}, name={}, contact_db={}, message_db={}, setting={}, kv_setting={}, session_db={}",
                 self.account,
                 self.wxid,
                 self.name,
-                self.contact.is_some(),
-                !self.messages.is_empty(),
+                has_contact,
+                has_messages,
                 self.setting.is_some(),
                 self.kv_setting.is_some(),
-                self.session.is_some()
+                has_session
             );
         }
         ret
@@ -1036,6 +1041,27 @@ impl UserDB {
 
     fn get_contacts(&self) -> Vec<String> {
         self.find_contacts("")
+    }
+
+    fn available_chat_summaries(&self) -> Vec<String> {
+        let chat_keys = self.chats.keys().map(|s| s.as_str()).collect::<Vec<_>>();
+        let mut summaries = self
+            .contacts
+            .iter()
+            .filter(|(hash, _)| chat_keys.iter().any(|&i| i == hash.as_str()))
+            .map(|(hash, contact)| {
+                format!(
+                    "{} | {} | {}",
+                    hash,
+                    contact.name,
+                    contact
+                        .get_remark()
+                        .unwrap_or_else(|e| format!("No Remark: {}", e))
+                )
+            })
+            .collect::<Vec<_>>();
+        summaries.sort();
+        summaries
     }
 
     fn find_contacts<S: ToString>(&self, name: S) -> Vec<String> {
@@ -1405,7 +1431,7 @@ impl UserDB {
             use std::collections::HashSet;
             let loaded_hashs = attach
                 .values()
-                .map(|data| Blob::new(data.clone()).hash)
+                .map(|data| Hash32::sha3_256(data).to_hex())
                 .collect::<HashSet<_>>();
             for (hash, path) in
                 line.get_attach_hashs(backup, &self.account, &gen_md5(&contact.name))
@@ -1494,7 +1520,24 @@ impl UserDB {
         name: String,
         skip_resource: bool,
     ) -> Vec<RecordType> {
-        self.find_contacts(&name)
+        let contacts = self.find_contacts(&name);
+        if contacts.is_empty() {
+            let available = self.available_chat_summaries();
+            if available.is_empty() {
+                warn!(
+                    "chat selector did not match and no available chat contacts were found: account={}, selector={}",
+                    self.account, name
+                );
+            } else {
+                warn!(
+                    "chat selector did not match: account={}, selector={}. Available chats: {}",
+                    self.account,
+                    name,
+                    available.join("; ")
+                );
+            }
+        }
+        contacts
             .iter()
             .filter_map(|chat_id| {
                 info!("Extracting: {} => {}", name, chat_id);
@@ -1515,19 +1558,45 @@ impl Extractor {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let mut backup = Backup::new(path)?;
         if backup.manifest.is_encrypted {
-            backup.parse_keybag()?;
+            backup.parse_keybag().map_err(|e| {
+                error!("failed to parse encrypted backup keybag: {}", e);
+                e
+            })?;
             debug!("trying decrypt of backup keybag");
             if let Some(ref mut kb) = backup.manifest.keybag.as_mut() {
                 let pass = rpassword::prompt_password("Backup Password: ")?;
                 kb.unlock_with_passcode(&pass);
+            } else {
+                error!("encrypted backup has no keybag");
+                return Err(
+                    Error::new(ErrorKind::InvalidData, "encrypted backup has no keybag").into(),
+                );
             }
-            backup.manifest.unlock_manifest();
-            backup.parse_manifest()?;
-            backup.unwrap_file_keys()?;
+            catch_unwind(AssertUnwindSafe(|| backup.manifest.unlock_manifest())).map_err(|_| {
+                error!("failed to unlock encrypted backup manifest; check backup password");
+                Error::new(
+                    ErrorKind::PermissionDenied,
+                    "failed to unlock encrypted backup manifest",
+                )
+            })?;
+            backup.parse_manifest().map_err(|e| {
+                error!(
+                    "failed to decrypt or parse encrypted backup manifest; check backup password: {}",
+                    e
+                );
+                e
+            })?;
+            backup.unwrap_file_keys().map_err(|e| {
+                error!("failed to unwrap encrypted backup file keys: {}", e);
+                e
+            })?;
         } else {
             backup.parse_manifest()?;
         }
         let user_info = Self::get_user_info(&backup);
+        if user_info.is_empty() {
+            warn!("no complete user database found in backup");
+        }
         Ok(Self { backup, user_info })
     }
 
@@ -1548,6 +1617,12 @@ impl Extractor {
             backup.find_wildcard_paths(DOMAIN, "*/mmsetting.archive.*"),
             backup.find_wildcard_paths(DOMAIN, "*/session/session.db"),
         ];
+        if paths.iter().all(Vec::is_empty) {
+            warn!(
+                "no database files found in backup domain {}; expected WCDB_Contact.sqlite, MM.sqlite/message_*.sqlite, mmsetting.archive, and session.db",
+                DOMAIN
+            );
+        }
         for file in paths.iter().flatten() {
             let path = Path::new(&file.relative_filename);
             if MATCHED_NAME.contains(&path.name_str())
@@ -1637,27 +1712,31 @@ impl Matcher {
     }
 }
 
-fn merge_metadata(
-    recorder: &SqliteChatRecorder,
-    attaches: &Attachments,
-    old: Vec<u8>,
-    new: Vec<u8>,
-) -> Option<Vec<u8>> {
-    if let Ok((old, new)) = from_slice(&old)
-        .map_err(|e| error!("Failed to parse old metadata: {}", e))
-        .and_then(|old| {
-            // 调用前已做判断，metadata必为非空
-            from_slice::<AttachMetadata>(&new)
-                // 新元数据是即时生成的，不应该解析错误
-                .map_err(|e| panic!("Failed to parse new metadata: {}", e))
-                .map(|new| (old, new))
-        })
-    {
-        to_vec(&new.merge(recorder, attaches, old))
-            .map_err(|e| error!("Failed to serialize metadata: {}", e))
-            .ok()
-    } else {
-        Some(new)
+struct iOSWCMetadataMerger;
+
+#[async_trait::async_trait]
+impl MetadataMerger for iOSWCMetadataMerger {
+    async fn merge(
+        &self,
+        store: &ChatStore,
+        attaches: &Attachments,
+        old: Vec<u8>,
+        new: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        if let Ok((old, new)) = from_slice(&old)
+            .map_err(|e| error!("Failed to parse old metadata: {}", e))
+            .and_then(|old| {
+                from_slice::<AttachMetadata>(&new)
+                    .map_err(|e| panic!("Failed to parse new metadata: {}", e))
+                    .map(|new| (old, new))
+            })
+        {
+            to_vec(&new.merge(store, attaches, old).await)
+                .map_err(|e| error!("Failed to serialize metadata: {}", e))
+                .ok()
+        } else {
+            Some(new)
+        }
     }
 }
 
@@ -1680,7 +1759,222 @@ impl MsgMatcher for Matcher {
         )
     }
 
-    fn get_metadata_merger(&self) -> Option<SqliteMetadataMerger> {
-        Some(merge_metadata)
+    fn get_metadata_merger(&self) -> Option<Box<dyn MetadataMerger>> {
+        Some(Box::new(iOSWCMetadataMerger))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, ImageFormat, Rgba};
+    use std::io::Cursor;
+    use tempfile::tempdir;
+
+    fn png(seed: u8) -> Vec<u8> {
+        let mut image = ImageBuffer::new(10, 10);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgba([seed.wrapping_add(x as u8), y as u8, 128, 255]);
+        }
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn available_chat_summaries_include_selector_ids() {
+        let mut user_db = UserDB::default();
+        user_db
+            .chats
+            .insert("chat-hash".into(), "Chat_chat-hash".into());
+        user_db
+            .contacts
+            .insert("chat-hash".into(), Contact::from_name("alice".into()));
+        user_db
+            .contacts
+            .insert("no-chat".into(), Contact::from_name("bob".into()));
+
+        assert_eq!(user_db.find_contacts("missing"), Vec::<String>::new());
+        let summaries = user_db.available_chat_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].contains("chat-hash"));
+        assert!(summaries[0].contains("alice"));
+    }
+
+    #[tokio::test]
+    async fn ios_wechat_image_thumbnail_metadata_merge_sample() {
+        let dir = tempdir().unwrap();
+        let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
+        let old_img = png(1);
+        let old_img_hash = Hash32::sha3_256(&old_img).to_hex();
+        let old_thum_hash = Hash32::sha3_256(png(2)).to_hex();
+        let new_thum = png(3);
+        let new_thum_hash = Hash32::sha3_256(&new_thum).to_hex();
+
+        let old_metadata = AttachMetadata::new()
+            .with_hash("img".into(), old_img_hash.clone())
+            .with_hash("thum".into(), old_thum_hash)
+            .with_type(MsgType::Image);
+        let new_metadata = AttachMetadata::new()
+            .with_hash("thum".into(), new_thum_hash.clone())
+            .with_type(MsgType::Image);
+
+        let record = Record {
+            chat_type: "WeChat".into(),
+            owner_id: "owner".into(),
+            group_id: "group".into(),
+            sender_id: "sender".into(),
+            sender_name: "sender".into(),
+            content: "[img]".into(),
+            timestamp: 1,
+            metadata: Some(to_vec(&old_metadata).unwrap()),
+            ..Default::default()
+        };
+        store
+            .insert_or_update(
+                RecordType::from((
+                    record,
+                    [(old_img_hash.clone(), old_img)].iter().cloned().collect(),
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let merger = iOSWCMetadataMerger;
+        let merged = merger
+            .merge(
+                &store,
+                &[(new_thum_hash.clone(), new_thum)]
+                    .iter()
+                    .cloned()
+                    .collect(),
+                to_vec(&old_metadata).unwrap(),
+                to_vec(&new_metadata).unwrap(),
+            )
+            .await
+            .unwrap();
+        let merged: AttachMetadata = from_slice(&merged).unwrap();
+        assert_eq!(
+            merged.hash.get("img").and_then(MetadataType::get_hash),
+            Some(old_img_hash.as_str())
+        );
+        assert_eq!(
+            merged.hash.get("thum").and_then(MetadataType::get_hash),
+            Some(new_thum_hash.as_str())
+        );
+    }
+
+    struct TestMatcher {
+        records: Vec<RecordType>,
+    }
+
+    impl MsgMatcher for TestMatcher {
+        fn get_records(&self) -> Option<Vec<RecordType>> {
+            Some(self.records.clone())
+        }
+
+        fn get_metadata_merger(&self) -> Option<Box<dyn MetadataMerger>> {
+            Some(Box::new(iOSWCMetadataMerger))
+        }
+    }
+
+    #[tokio::test]
+    async fn ios_wechat_importer_path_merges_image_metadata_and_assets() {
+        let dir = tempdir().unwrap();
+        let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
+        let old_img = png(1);
+        let old_img_hash = Hash32::sha3_256(&old_img).to_hex();
+        let old_thum = png(2);
+        let old_thum_hash = Hash32::sha3_256(&old_thum).to_hex();
+        let new_thum = png(3);
+        let new_thum_hash = Hash32::sha3_256(&new_thum).to_hex();
+
+        let base_record = Record {
+            chat_type: "WeChat".into(),
+            owner_id: "owner".into(),
+            group_id: "group".into(),
+            sender_id: "sender".into(),
+            sender_name: "sender".into(),
+            content: "[img]".into(),
+            timestamp: 1,
+            ..Default::default()
+        };
+        let old_record = Record {
+            metadata: Some(
+                to_vec(
+                    &AttachMetadata::new()
+                        .with_hash("img".into(), old_img_hash.clone())
+                        .with_hash("thum".into(), old_thum_hash.clone())
+                        .with_type(MsgType::Image),
+                )
+                .unwrap(),
+            ),
+            ..base_record.clone()
+        };
+        export_matcher(
+            &mut store,
+            &TestMatcher {
+                records: vec![RecordType::from((
+                    old_record,
+                    [
+                        (old_img_hash.clone(), old_img),
+                        (old_thum_hash.clone(), old_thum),
+                    ]
+                    .iter()
+                    .cloned()
+                    .collect(),
+                ))],
+            },
+        )
+        .await
+        .unwrap();
+
+        let new_record = Record {
+            metadata: Some(
+                to_vec(
+                    &AttachMetadata::new()
+                        .with_hash("thum".into(), new_thum_hash.clone())
+                        .with_type(MsgType::Image),
+                )
+                .unwrap(),
+            ),
+            ..base_record
+        };
+        export_matcher(
+            &mut store,
+            &TestMatcher {
+                records: vec![RecordType::from((
+                    new_record,
+                    [(new_thum_hash.clone(), new_thum.clone())]
+                        .iter()
+                        .cloned()
+                        .collect(),
+                ))],
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = store.query(crate::store::Query::default()).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        let metadata: AttachMetadata = from_slice(stored[0].metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            metadata.hash.get("img").and_then(MetadataType::get_hash),
+            Some(old_img_hash.as_str())
+        );
+        assert_eq!(
+            metadata.hash.get("thum").and_then(MetadataType::get_hash),
+            Some(new_thum_hash.as_str())
+        );
+        assert_eq!(
+            store
+                .get_asset(Hash32::from_hex(&new_thum_hash).unwrap())
+                .await
+                .unwrap(),
+            Some(new_thum)
+        );
     }
 }

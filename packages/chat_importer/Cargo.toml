@@ -7,14 +7,16 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
 anyhow = "1.0.92"
+async-trait = "0.1.83"
+assetpack-core = "0.1.0"
 base64 = "0.22.1"
 binread = "1.4.1"
 fern = "0.7.0"
-gchdb = { git = "https://github.com/darkskygit/GCHDB" }
 hex = "0.4.3"
 htmlescape = "0.3.1"
 lazy_static = "1.5.0"
 mailparse = "0.15.0"
+memory-indexer = "0.3.1"
 md-5 = "0.9.1"
 mur3 = "0.1.0"
 num_enum = "0.7.3"
@@ -25,6 +27,7 @@ rpassword = "7.3.1"
 scraper = "0.12.0"
 serde_json = "1.0.132"
 tempfile = "3.13.0"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "fs"] }
 walkdir = "2.3.1"
 
 chrono = { workspace = true }
@@ -33,6 +36,7 @@ log = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "chrono"] }
 
 [dependencies.image]
 version = "0.25.4"

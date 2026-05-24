@@ -175,20 +175,48 @@ impl MsgMatcher for Matcher {
     }
 }
 
-#[test]
-fn test_ios_sms_db() -> SqliteResult<()> {
-    let matcher = Extractor::new("sms.db", "".into())?;
-    println!(
-        "{}",
-        matcher
-            .get_chat_ids()?
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    for recorder in matcher.get_record_lines(0)? {
-        println!("{:?}", recorder);
-    }
+#[tokio::test]
+async fn ios_sms_minimal_sample() -> SqliteResult<()> {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let conn = Connection::open(file.path())?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+        CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+        CREATE TABLE message (
+            ROWID INTEGER PRIMARY KEY,
+            text TEXT,
+            handle_id INTEGER,
+            service TEXT,
+            date INTEGER,
+            is_from_me INTEGER,
+            destination_caller_id TEXT,
+            is_spam INTEGER
+        );
+        INSERT INTO handle (ROWID, id) VALUES (1, '+10000000000');
+        INSERT INTO message
+            (ROWID, text, handle_id, service, date, is_from_me, destination_caller_id, is_spam)
+        VALUES
+            (1, 'hello sms', 1, 'iMessage', 0, 0, '+19999999999', 0);
+        INSERT INTO chat_message_join (chat_id, message_id) VALUES (7, 1);
+        "#,
+    )?;
+    drop(conn);
+
+    let matcher = Extractor::new(file.path(), "Owner".into())?;
+    let records = matcher.get_records().unwrap();
+    assert_eq!(records.len(), 1);
+    let record = records[0].get_record();
+    assert_eq!(record.chat_type, "iOS iMessage");
+    assert_eq!(record.group_id, "+10000000000");
+    assert_eq!(record.sender_name, "+10000000000");
+    assert_eq!(record.content, "hello sms");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
+    export_matcher(&mut store, &matcher).await.unwrap();
+    let stored = store.query(crate::store::Query::default()).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].content, "hello sms");
     Ok(())
 }

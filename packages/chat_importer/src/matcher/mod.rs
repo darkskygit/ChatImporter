@@ -5,7 +5,6 @@ mod win_qq_html;
 mod win_qq_mht;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use gchdb::{Attachments, Blob, MetadataMerger, Record, RecordType};
 use htmlescape::decode_html;
 use lazy_static::lazy_static;
 pub use log::{debug, error, info, warn};
@@ -13,17 +12,17 @@ use path_ext::PathExt;
 use regex::{Captures, Regex};
 use utils::{blob_dhash, hamming_distance};
 
-type SqliteMetadataMerger = MetadataMerger<SqliteChatRecorder>;
+use crate::store::{Attachments, ChatStore, MetadataMerger, Record, RecordType};
+use assetpack_core::Hash32;
 
 pub trait MsgMatcher {
     fn get_records(&self) -> Option<Vec<RecordType>>;
-    fn get_metadata_merger(&self) -> Option<SqliteMetadataMerger> {
+    fn get_metadata_merger(&self) -> Option<Box<dyn MetadataMerger>> {
         None
     }
 }
 
 use anyhow::{Context, Result};
-use gchdb::{ChatRecorder, SqliteChatRecorder};
 use std::fs::read;
 use std::path::Path;
 use std::time::Instant;
@@ -35,7 +34,7 @@ pub enum ExportType<P: AsRef<Path>> {
     iOSSMS(P, String),
 }
 
-pub fn exporter<P>(recorder: &mut SqliteChatRecorder, export_type: ExportType<P>) -> Result<()>
+pub async fn exporter<P>(store: &mut ChatStore, export_type: ExportType<P>) -> Result<()>
 where
     P: AsRef<Path>,
 {
@@ -52,33 +51,36 @@ where
         ExportType::iOSWeChat(path, names) => ios_wc::Matcher::new(path, names)?,
         ExportType::iOSSMS(path, owner) => ios_sms::Matcher::new(path, owner)?,
     };
+    export_matcher(store, matcher.as_ref()).await
+}
+
+async fn export_matcher(store: &mut ChatStore, matcher: &dyn MsgMatcher) -> Result<()> {
     let records = matcher.get_records().context("Cannot transfrom records")?;
+    let total = records.len();
+    let merger = matcher.get_metadata_merger();
     let mut progress = 0.0;
     let mut sw = Instant::now();
-    for (i, record) in records.iter().enumerate() {
-        if (i + 1) as f64 / records.len() as f64 - progress > 0.01 {
-            progress = (i + 1) as f64 / records.len() as f64;
+    for (i, record) in records.into_iter().enumerate() {
+        if (i + 1) as f64 / total as f64 - progress > 0.01 {
+            progress = (i + 1) as f64 / total as f64;
             info!(
                 "current progress: {:.2}%, {}/{}, {}ms",
                 progress * 100.0,
                 i,
-                records.len(),
+                total,
                 sw.elapsed().as_millis()
             );
             sw = Instant::now();
         }
-        if !recorder
-            .insert_or_update_record(record.clone(), matcher.get_metadata_merger())
-            .context(format!("Cannot insert records: {}", record.display()))?
+        let display = record.display();
+        if !store
+            .insert_or_update(record, merger.as_deref())
+            .await
+            .context(format!("Cannot insert records: {}", display))?
         {
-            let content = record
-                .get_record()
-                .map(|r| r.content.clone())
-                .unwrap_or_default();
-            warn!("Failed to insert record: {}", content);
+            warn!("Failed to insert record: {}", display);
         }
     }
-    recorder.refresh_index()?;
     Ok(())
 }
 
@@ -101,25 +103,16 @@ fn modify_timestamp(record_type: RecordType, near_sec: Option<i64>) -> Option<Re
                 timestamp: max(near_sec, record.timestamp) + 1,
                 ..record
             })),
-            RecordType::RecordRef(record) => Some(RecordType::from(Record {
-                timestamp: max(near_sec, record.timestamp) + 1,
-                ..record.clone()
-            })),
-            RecordType::RecordWithAttaches { record, attaches } => Some(RecordType::from((
+            RecordType::RecordWithAttachments {
+                record,
+                attachments,
+            } => Some(RecordType::from((
                 Record {
                     timestamp: max(near_sec, record.timestamp) + 1,
                     ..record
                 },
-                attaches,
+                attachments,
             ))),
-            RecordType::RecordRefWithAttaches { record, attaches } => Some(RecordType::from((
-                Record {
-                    timestamp: max(near_sec, record.timestamp) + 1,
-                    ..record.clone()
-                },
-                attaches,
-            ))),
-            _ => None,
         }
     } else {
         Some(record_type)

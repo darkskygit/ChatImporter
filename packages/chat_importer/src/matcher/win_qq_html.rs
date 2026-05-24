@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Clone, Serialize)]
 pub enum QQMsgImage {
     Attach { name: String, data: Vec<u8> },
-    Hash(i64),
+    Hash(String),
     UnmatchName(String),
 }
 
@@ -296,7 +296,7 @@ impl Extractor {
                             .iter()
                             .map(|image| match image {
                                 QQMsgImage::Attach { data, .. } => {
-                                    QQMsgImage::Hash(Blob::new(data.clone()).hash)
+                                    QQMsgImage::Hash(Hash32::sha3_256(data).to_hex())
                                 }
                                 other => other.clone(),
                             })
@@ -367,23 +367,19 @@ impl MsgMatcher for Extractor {
                             Some(line @ QQMsgLine::Message { .. }) => {
                                 self.transfrom_record(group_id.clone(), date, line).map(
                                     |record_type| {
-                                        record_type
-                                            .get_record()
-                                            .and_then(|record| {
-                                                modify_timestamp(
-                                                    record_type.clone(),
-                                                    ret.iter()
-                                                        .filter_map(|r| r.get_record())
-                                                        .filter(|r| {
-                                                            i64::abs(r.timestamp - record.timestamp)
-                                                                < 1000
-                                                                && r.sender_id == record.sender_id
-                                                        })
-                                                        .map(|r| r.timestamp)
-                                                        .max(),
-                                                )
-                                            })
-                                            .map(|record| ret.push(record))
+                                        let current = record_type.get_record();
+                                        let record = modify_timestamp(
+                                            record_type.clone(),
+                                            ret.iter()
+                                                .map(|r| r.get_record())
+                                                .filter(|r| {
+                                                    i64::abs(r.timestamp - current.timestamp) < 1000
+                                                        && r.sender_id == current.sender_id
+                                                })
+                                                .map(|r| r.timestamp)
+                                                .max(),
+                                        );
+                                        record.map(|record| ret.push(record))
                                     },
                                 );
                                 (date, ret)
@@ -394,5 +390,82 @@ impl MsgMatcher for Extractor {
                     .1
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{ChatStore, Query, RecordType};
+    use tempfile::tempdir;
+
+    struct TestAttachGetter;
+
+    impl QQAttachGetter for TestAttachGetter {
+        fn get_attach(&self, path: &str) -> QQMsgImage {
+            QQMsgImage::Attach {
+                name: path.into(),
+                data: b"qq-image".to_vec(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn windows_qq_html_minimal_sample() {
+        let html = r#"
+        <html><body><table><tbody>
+            <tr><td></td></tr>
+            <tr><td><div>消息分组:联系人</div></td></tr>
+            <tr><td><div>消息对象:Bob(456)</div></td></tr>
+            <tr><td></td></tr>
+            <tr><td>日期: 2024-01-01</td></tr>
+            <tr><td>
+                <div><div>Alice(123)</div> 12:34:56</div>
+                <div>hello<img src="pic.png"></div>
+            </td></tr>
+        </tbody></table></body></html>
+        "#;
+        let extractor = Extractor::new(
+            html.into(),
+            "owner".into(),
+            "Bob(456)".into(),
+            TestAttachGetter,
+        );
+        let records = extractor.get_records().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = records[0].get_record();
+        assert_eq!(record.chat_type, "QQ");
+        assert_eq!(record.group_id, "Bob(456)");
+        assert_eq!(record.sender_id, "456");
+        assert_eq!(record.content, "hello<img>");
+        let metadata = String::from_utf8(record.metadata.clone().unwrap()).unwrap();
+        assert!(metadata.contains(&Hash32::sha3_256(b"qq-image").to_hex()));
+        match &records[0] {
+            RecordType::RecordWithAttachments { attachments, .. } => {
+                assert_eq!(attachments.get("pic.png").unwrap(), b"qq-image");
+            }
+            _ => panic!("expected attachment record"),
+        }
+
+        let dir = tempdir().unwrap();
+        let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
+        crate::matcher::export_matcher(&mut store, &extractor)
+            .await
+            .unwrap();
+        let stored = store.query(Query::default()).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].chat_type, "QQ");
+        assert_eq!(stored[0].group_id, "Bob(456)");
+        assert_eq!(stored[0].content, "hello<img>");
+        match &records[0] {
+            RecordType::RecordWithAttachments { attachments, .. } => {
+                let hash = Hash32::sha3_256(attachments.get("pic.png").unwrap());
+                assert_eq!(
+                    store.get_asset(hash).await.unwrap().unwrap(),
+                    b"qq-image".to_vec()
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 }

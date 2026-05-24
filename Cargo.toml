@@ -13,7 +13,6 @@ rusqlite = "0.32.1"
 serde = { version = "1.0.214", features = ["derive"] }
 thiserror = "1.0.66"
 
-gchdb = { git = "https://github.com/darkskygit/GCHDB" }
 ibackuptool2 = { path = "packages/ibackuptool2" }
 
 [profile.release]

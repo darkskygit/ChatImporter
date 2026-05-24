@@ -159,7 +159,7 @@ impl KeyBag {
         debug!("iterations: {}", iterations);
         debug!("salt: {:?}", self.salt);
         debug!("deriving keys... (this may take a while)");
-        debug!("1. pbkdf2-sha256(it: {}, ps: {})", dpic, passcode);
+        debug!("1. pbkdf2-sha256(it: {}, ps: <redacted>)", dpic);
 
         // 1. Round of pbkdf2-sha256(passcode)
         pbkdf2::derive(
@@ -172,11 +172,7 @@ impl KeyBag {
 
         // 2. Round of pbkdf2-sha1(pbkdf2-sha256(passcode))
         debug!("done.");
-        debug!(
-            "2. pbkdf2-sha2(it: {}, ps: {})",
-            iterations,
-            hex::encode(&passcode1)
-        );
+        debug!("2. pbkdf2-sha2(it: {}, ps: <redacted>)", iterations);
         pbkdf2::derive(
             pbkdf2::PBKDF2_HMAC_SHA1,
             std::num::NonZeroU32::new(iterations as u32).unwrap(),
@@ -185,8 +181,7 @@ impl KeyBag {
             passcode_key.as_mut_slice(),
         );
 
-        debug!("3. result = {}", hex::encode(&passcode_key));
-        debug!("{:?}", passcode_key);
+        debug!("3. result = <redacted>");
 
         info!("deriving keys [done]");
         // crypto::pbkdf2::pbkdf2(&mut mac, &self.double_protection_salt.as_slice(), self.dpic, passcode1.as_mut_slice());
