@@ -1,53 +1,56 @@
 [package]
-name = "chat_importer"
-version = "0.1.0"
 authors = ["DarkSky <darksky2048@gmail.com>"]
 edition = "2018"
+name    = "chat_importer"
+version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
-anyhow = "1.0.92"
-async-trait = "0.1.83"
+anyhow = "1.0.102"
 assetpack-core = "0.1.0"
 assetpack-transform-precomp2 = "0.1.0"
+async-trait = "0.1.89"
 base64 = "0.22.1"
-binread = "1.4.1"
-fern = "0.7.0"
-hex = "0.4.3"
+fern = "0.7.1"
 htmlescape = "0.3.1"
-indicatif = "0.17.9"
+indicatif = "0.18.4"
 indicatif-log-bridge = "0.2.3"
 lazy_static = "1.5.0"
-mailparse = "0.15.0"
+mailparse = "0.16.1"
+md-5 = "0.11.0"
 memory-indexer = "0.3.1"
-md-5 = "0.9.1"
 mur3 = "0.1.0"
-num_enum = "0.7.3"
+num_enum = "0.7.6"
 path-absolutize = "3.1.1"
-path-ext = "0.1.1"
-plist = "1.7.0"
-prost = "0.13.4"
-rpassword = "7.3.1"
-scraper = "0.12.0"
-serde_json = "1.0.132"
-tempfile = "3.13.0"
+path-ext = "0.1.2"
+prost = "0.14.3"
+roxmltree = "0.21.1"
+rpassword = "7.5.3"
+scraper = "0.27.0"
+serde_json = "1.0.150"
+sqlx = { version = "0.8.6", features = [
+  "sqlite",
+  "runtime-tokio-rustls",
+  "chrono",
+] }
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "fs"] }
-walkdir = "2.3.1"
+walkdir = "2.5.0"
 
-chrono = { workspace = true }
+chrono       = { workspace = true }
+hex          = { workspace = true }
 ibackuptool2 = { workspace = true }
-log = { workspace = true }
-regex = { workspace = true }
-roxmltree = "0.20.0"
-rusqlite = { workspace = true }
-serde = { workspace = true }
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "chrono"] }
+log          = { workspace = true }
+plist        = { workspace = true }
+regex        = { workspace = true }
+rusqlite     = { workspace = true }
+serde        = { workspace = true }
+tempfile     = { workspace = true }
 
-[dependencies.image]
-version = "0.25.4"
-default-features = false
-features = ["bmp", "jpeg", "png"]
+  [dependencies.image]
+  default-features = false
+  features         = ["bmp", "jpeg", "png"]
+  version          = "0.25.4"
 
-[dependencies.structopt]
-version = "0.3.18"
-default-features = false
+  [dependencies.structopt]
+  default-features = false
+  version          = "0.3.18"

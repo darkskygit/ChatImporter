@@ -57,10 +57,8 @@ impl SessionIndex {
                     ))
                 })?
                 .filter_map(|row| {
-                    row.map_err(|err| {
-                        warn!("failed to parse universal session row: {}", err)
-                    })
-                    .ok()
+                    row.map_err(|err| warn!("failed to parse universal session row: {}", err))
+                        .ok()
                 })
                 .collect::<HashMap<_, _>>();
             index.summaries.extend(summaries);

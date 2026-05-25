@@ -262,7 +262,7 @@ impl Drop for PipelineProgress {
 
 fn gen_md5<S: ToString>(user_name: S) -> String {
     use md5::{Digest, Md5};
-    format!("{:x}", Md5::digest(user_name.to_string().as_bytes()))
+    hex::encode(Md5::digest(user_name.to_string().as_bytes()))
 }
 
 fn hex2b64(hex: &str) -> String {

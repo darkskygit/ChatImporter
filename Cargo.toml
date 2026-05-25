@@ -1,23 +1,25 @@
 [workspace]
+members  = ["packages/chat_importer", "packages/ibackuptool2"]
 resolver = "2"
-members = ["packages/chat_importer", "packages/ibackuptool2"]
 
-[workspace.dependencies]
-chrono = "0.4.38"
-log = { version = "0.4.22", features = [
+  [workspace.dependencies]
+  chrono = "0.4.44"
+  hex = "0.4.3"
+  log = { version = "0.4.30", features = [
     "max_level_trace",
     "release_max_level_info",
-] }
-regex = "1.11.1"
-rusqlite = { version = "0.32.1", features = ["serialize"] }
-serde = { version = "1.0.214", features = ["derive"] }
-thiserror = "1.0.66"
+  ] }
+  plist = "1.9.0"
+  regex = "1.12.3"
+  rusqlite = { version = "0.32.1", features = ["serialize"] }
+  serde = { version = "1.0.228", features = ["derive"] }
+  tempfile = "3.27.0"
 
-ibackuptool2 = { path = "packages/ibackuptool2" }
+  ibackuptool2 = { path = "packages/ibackuptool2" }
 
 [profile.release]
-lto = true
+lto   = true
 panic = "abort"
 # opt-level = "z"
 codegen-units = 1
-incremental = false
+incremental   = false

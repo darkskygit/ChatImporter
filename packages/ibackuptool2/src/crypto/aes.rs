@@ -1,28 +1,26 @@
+use aes::cipher::{
+    block_padding::NoPadding, BlockCipherDecrypt, BlockModeDecrypt, KeyInit, KeyIvInit,
+};
+use aes::Aes256;
 use log::{trace, warn};
-
-use ::crypto::buffer::{RefReadBuffer, RefWriteBuffer};
 
 use super::{pack_u64, unpack_64_bit};
 use crate::BackupError;
 
 /// perform aes_cbc_256
-pub fn decrypt_with_key(key: &Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
+pub fn decrypt_with_key(key: &Vec<u8>, data: &[u8]) -> Vec<u8> {
     const ZERO_IV: &[u8] = &[0u8; 16];
 
-    // Use CBC decryption for files
-    let mut dec = ::crypto::aes::cbc_decryptor(
-        ::crypto::aes::KeySize::KeySize256,
-        key.as_slice(),
-        ZERO_IV,
-        ::crypto::blockmodes::NoPadding,
-    );
-
     let mut out: Vec<u8> = vec![0u8; data.len()];
-    let mut output = RefWriteBuffer::new(out.as_mut_slice());
-    let mut input = RefReadBuffer::new(data.as_slice());
-
-    let result = dec.decrypt(&mut input, &mut output, true);
-    trace!("decrypt: is_err: {}", result.is_err());
+    out.copy_from_slice(data);
+    let is_err = match cbc::Decryptor::<Aes256>::new_from_slices(key.as_slice(), ZERO_IV) {
+        Ok(dec) => dec.decrypt_padded::<NoPadding>(&mut out).is_err(),
+        Err(_) => true,
+    };
+    trace!("decrypt: is_err: {}", is_err);
+    if is_err {
+        out.fill(0);
+    }
     out
 }
 
@@ -91,34 +89,25 @@ pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Result<Vec<u8>, BackupError> {
                 hex::encode(packed.as_slice())
             );
 
-            {
-                trace!("aes_ecb_256_dec({:x?})", kek);
-                let mut dec = ::crypto::aes::ecb_decryptor(
-                    ::crypto::aes::KeySize::KeySize256,
-                    kek,
-                    ::crypto::blockmodes::NoPadding,
-                );
-
-                let mut out: Vec<u8> = vec![0u8; 16];
-                let mut output = RefWriteBuffer::new(out.as_mut_slice());
-                let mut input = RefReadBuffer::new(packed.as_slice());
-
-                let result = dec.decrypt(&mut input, &mut output, true);
-                trace!("is_Err: {}", result.is_err());
-                if result.is_err() {
-                    return Err(BackupError::InvalidKeybag);
-                }
-                trace!("res: {}", hex::encode(&out));
-
-                a = u64::from_be_bytes(
-                    unpack_64_bit(&out.as_slice()[0..8]).ok_or(BackupError::InvalidKeybag)?,
-                );
-                trace!("new a: {:x?}", a);
-                r[i] = u64::from_be_bytes(
-                    unpack_64_bit(&out.as_slice()[8..16]).ok_or(BackupError::InvalidKeybag)?,
-                );
-                trace!("new r[{}]: {:x?}", i, a);
+            trace!("aes_ecb_256_dec({:x?})", kek);
+            let cipher = Aes256::new_from_slice(kek).map_err(|_| BackupError::InvalidKeybag)?;
+            if packed.len() != 16 {
+                return Err(BackupError::InvalidKeybag);
             }
+            let mut block = aes::Block::default();
+            block.copy_from_slice(&packed);
+            cipher.decrypt_block(&mut block);
+            let out = block.as_slice().to_vec();
+            trace!("res: {}", hex::encode(&out));
+
+            a = u64::from_be_bytes(
+                unpack_64_bit(&out.as_slice()[0..8]).ok_or(BackupError::InvalidKeybag)?,
+            );
+            trace!("new a: {:x?}", a);
+            r[i] = u64::from_be_bytes(
+                unpack_64_bit(&out.as_slice()[8..16]).ok_or(BackupError::InvalidKeybag)?,
+            );
+            trace!("new r[{}]: {:x?}", i, a);
         }
     }
 
@@ -141,4 +130,29 @@ pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Result<Vec<u8>, BackupError> {
     trace!("decrypt result: {}", hex::encode(&result));
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrypt_with_key_matches_aes_256_cbc_zero_iv_vector() {
+        let key = hex::decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .unwrap();
+        let ciphertext = hex::decode("8ea2b7ca516745bfeafc49904b496089").unwrap();
+        let plaintext = hex::decode("00112233445566778899aabbccddeeff").unwrap();
+
+        assert_eq!(decrypt_with_key(&key, &ciphertext), plaintext);
+    }
+
+    #[test]
+    fn unwrap_key_matches_aes_kw_256_bit_kek_vector() {
+        let kek = hex::decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .unwrap();
+        let wrapped = hex::decode("64e8c3f9ce0f5ba263e9777905818a2a93c8191e7d6e8ae7").unwrap();
+        let plaintext = hex::decode("00112233445566778899aabbccddeeff").unwrap();
+
+        assert_eq!(unwrap_key(&kek, &wrapped).unwrap(), plaintext);
+    }
 }

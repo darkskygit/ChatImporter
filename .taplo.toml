@@ -1,0 +1,11 @@
+exclude = [
+  "node_modules/**/*.toml",
+  "target/**/*.toml",
+  "packages/frontend/apps/ios/App/Packages/AffineGraphQL/**/*.toml",
+]
+
+# https://taplo.tamasfe.dev/configuration/formatter-options.html
+[formatting]
+align_entries = true
+indent_tables = true
+reorder_keys  = true

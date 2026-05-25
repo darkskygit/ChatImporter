@@ -1,29 +1,29 @@
 [package]
-name = "ibackuptool2"
-version = "0.1.0"
 authors = ["Rich Infante <rich@richinfante.com>"]
 edition = "2018"
+name    = "ibackuptool2"
+version = "0.1.0"
 
 [dependencies]
-rust-crypto = "^0.2"
-plist = "1.0.0"
-dirs = "3.0.1"
-serde_bytes = "0.11.5"
-hex = "0.4.2"
-ring = "0.16.20"
-tempfile = "3.1.0"
-wildmatch = "1.0.11"
+aes         = "0.9.0"
+cbc         = "0.2.1"
+ring        = "0.17.14"
+serde_bytes = "0.11.19"
+wildmatch   = "1.1.0"
 
-chrono = { workspace = true }
-log = { workspace = true }
-regex = { workspace = true }
+chrono   = { workspace = true }
+hex      = { workspace = true }
+log      = { workspace = true }
+plist    = { workspace = true }
+regex    = { workspace = true }
 rusqlite = { workspace = true }
-serde = { workspace = true }
+serde    = { workspace = true }
+tempfile = { workspace = true }
 
-[dependencies.libsqlite3-sys]
-version = "0.30.1"
-features = ["bundled"]
+  [dependencies.libsqlite3-sys]
+  features = ["bundled"]
+  version  = "0.30.1"
 
-[dependencies.uuid]
-version = "0.8.1"
-features = ["v4"]
+  [dependencies.uuid]
+  features = ["v4"]
+  version  = "1.23.1"

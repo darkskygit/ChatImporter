@@ -20,6 +20,7 @@ impl<'a> SafeXml<'a> {
         let options = roxmltree::ParsingOptions {
             allow_dtd: false,
             nodes_limit: XML_NODE_LIMIT,
+            entity_resolver: None,
         };
         let doc = roxmltree::Document::parse_with_options(input, options)?;
         Ok(Self { doc })
