@@ -41,12 +41,6 @@ pub trait QQAttachGetter {
     }
 }
 
-// Path-based attachment lookup is kept for importing raw HTML exports outside MHT containers.
-#[allow(dead_code)]
-pub struct QQPathAttachGetter;
-
-impl QQAttachGetter for QQPathAttachGetter {}
-
 pub struct Extractor {
     html: Html,
     owner: String,
@@ -365,63 +359,87 @@ impl Extractor {
 }
 
 impl MsgMatcher for Extractor {
-    fn get_records(&self) -> Option<Vec<RecordType>> {
-        self.get_table().and_then(|table| {
-            Self::get_group_id(table.iter().take(4).collect::<Vec<_>>()).map(|(is_pm, group_id)| {
-                let group_id = if is_pm || group_id != "0" {
-                    group_id
-                } else {
-                    self.file_name.clone()
-                };
-                table
-                    .iter()
-                    .skip(4)
-                    .map(|elm| self.transfrom_msg_line(elm, is_pm))
-                    .fold(
-                        (None, Vec::<String>::new(), Vec::<RecordType>::new()),
-                        |(date, mut seen_source_ids, mut ret), curr| match curr {
-                            Some(QQMsgLine::Date(date)) => (
-                                Some(NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap()),
-                                seen_source_ids,
-                                ret,
-                            ),
-                            Some(line @ QQMsgLine::Message { .. }) => {
-                                let duplicate_index =
-                                    qq_duplicate_index(&group_id, date, &line, &seen_source_ids);
-                                self.transfrom_record(
-                                    group_id.clone(),
-                                    date,
-                                    duplicate_index,
-                                    line,
-                                )
-                                .map(|record_type| {
-                                    let current = record_type.get_record();
-                                    if let Some(source_message_id) =
-                                        current.source_message_id.clone()
-                                    {
-                                        seen_source_ids.push(source_message_id);
+    fn import_plan(&self) -> ImportPlan {
+        ImportPlan {
+            chats_total: Some(1),
+        }
+    }
+
+    fn get_record_batches(&self, progress: &PipelineProgress) -> Result<Vec<RecordBatch>> {
+        let records = self
+            .get_table()
+            .and_then(|table| {
+                Self::get_group_id(table.iter().take(4).collect::<Vec<_>>()).map(
+                    |(is_pm, group_id)| {
+                        let group_id = if is_pm || group_id != "0" {
+                            group_id
+                        } else {
+                            self.file_name.clone()
+                        };
+                        table
+                            .iter()
+                            .skip(4)
+                            .map(|elm| self.transfrom_msg_line(elm, is_pm))
+                            .fold(
+                                (None, Vec::<String>::new(), Vec::<RecordType>::new()),
+                                |(date, mut seen_source_ids, mut ret), curr| match curr {
+                                    Some(QQMsgLine::Date(date)) => (
+                                        Some(NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap()),
+                                        seen_source_ids,
+                                        ret,
+                                    ),
+                                    Some(line @ QQMsgLine::Message { .. }) => {
+                                        let duplicate_index = qq_duplicate_index(
+                                            &group_id,
+                                            date,
+                                            &line,
+                                            &seen_source_ids,
+                                        );
+                                        self.transfrom_record(
+                                            group_id.clone(),
+                                            date,
+                                            duplicate_index,
+                                            line,
+                                        )
+                                        .map(
+                                            |record_type| {
+                                                let current = record_type.get_record();
+                                                if let Some(source_message_id) =
+                                                    current.source_message_id.clone()
+                                                {
+                                                    seen_source_ids.push(source_message_id);
+                                                }
+                                                let record = modify_timestamp(
+                                                    record_type.clone(),
+                                                    ret.iter()
+                                                        .map(|r| r.get_record())
+                                                        .filter(|r| {
+                                                            i64::abs(
+                                                                r.timestamp - current.timestamp,
+                                                            ) < 1000
+                                                                && r.sender_id == current.sender_id
+                                                        })
+                                                        .map(|r| r.timestamp)
+                                                        .max(),
+                                                );
+                                                record.map(|record| ret.push(record))
+                                            },
+                                        );
+                                        (date, seen_source_ids, ret)
                                     }
-                                    let record = modify_timestamp(
-                                        record_type.clone(),
-                                        ret.iter()
-                                            .map(|r| r.get_record())
-                                            .filter(|r| {
-                                                i64::abs(r.timestamp - current.timestamp) < 1000
-                                                    && r.sender_id == current.sender_id
-                                            })
-                                            .map(|r| r.timestamp)
-                                            .max(),
-                                    );
-                                    record.map(|record| ret.push(record))
-                                });
-                                (date, seen_source_ids, ret)
-                            }
-                            None => (date, seen_source_ids, ret),
-                        },
-                    )
-                    .2
+                                    None => (date, seen_source_ids, ret),
+                                },
+                            )
+                            .2
+                    },
+                )
             })
-        })
+            .context("Cannot transform QQ records")?;
+        progress.chat_parsed(records.len() as u64, record_blob_count(&records) as u64);
+        Ok(vec![RecordBatch {
+            label: self.file_name.clone(),
+            records,
+        }])
     }
 }
 
@@ -530,7 +548,7 @@ mod tests {
             "Bob(456)".into(),
             TestAttachGetter,
         );
-        let records = extractor.get_records().unwrap();
+        let records = extractor.collect_records().unwrap();
         assert_eq!(records.len(), 1);
         let record = records[0].get_record();
         assert_eq!(record.chat_type, "QQ");
@@ -555,7 +573,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
-        crate::matcher::export_matcher(&mut store, &extractor)
+        crate::matcher::export_matcher(&mut store, &test_progress(), &extractor)
             .await
             .unwrap();
         let stored = store.query(Query::default()).await.unwrap();
@@ -594,7 +612,7 @@ mod tests {
             "Bob(456)".into(),
             TestAttachGetter,
         );
-        let records = extractor.get_records().unwrap();
+        let records = extractor.collect_records().unwrap();
         assert_eq!(records.len(), 2);
         assert_ne!(
             records[0].get_record().source_message_id,
@@ -603,7 +621,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
-        crate::matcher::export_matcher(&mut store, &extractor)
+        crate::matcher::export_matcher(&mut store, &test_progress(), &extractor)
             .await
             .unwrap();
         let stored = store.query(Query::default()).await.unwrap();
@@ -638,20 +656,20 @@ mod tests {
             TestAttachGetter,
         );
         assert_eq!(
-            first.get_records().unwrap()[0]
+            first.collect_records().unwrap()[0]
                 .get_record()
                 .source_message_id,
-            second.get_records().unwrap()[0]
+            second.collect_records().unwrap()[0]
                 .get_record()
                 .source_message_id
         );
 
         let dir = tempdir().unwrap();
         let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
-        crate::matcher::export_matcher(&mut store, &first)
+        crate::matcher::export_matcher(&mut store, &test_progress(), &first)
             .await
             .unwrap();
-        crate::matcher::export_matcher(&mut store, &second)
+        crate::matcher::export_matcher(&mut store, &test_progress(), &second)
             .await
             .unwrap();
         let stored = store.query(Query::default()).await.unwrap();

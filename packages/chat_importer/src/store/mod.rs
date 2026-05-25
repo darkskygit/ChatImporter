@@ -11,6 +11,7 @@ pub use types::{
     AssetWriteOutcome, Attachments, ConversationMergePreview, ConversationMergeRequest,
     MetadataMerger, Query, Record, RecordDuplicateCandidate, RecordType, WriteOutcome,
 };
+pub use write::PreparedRecord;
 
 const INDEX_NAME: &str = "chat_records";
 

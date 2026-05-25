@@ -63,10 +63,6 @@ impl RecordType {
             Self::Record(record) | Self::RecordWithAttachments { record, .. } => record,
         }
     }
-
-    pub fn display(&self) -> String {
-        self.get_record().display()
-    }
 }
 
 impl From<Record> for RecordType {

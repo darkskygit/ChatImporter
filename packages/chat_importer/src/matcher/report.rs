@@ -9,9 +9,14 @@ use crate::store::WriteOutcome;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImportMetrics {
     pub source_path_disk_bytes: u64,
+    pub chats_planned: u64,
+    pub chats_parsed: u64,
     pub records_seen: u64,
     pub records_inserted: u64,
     pub records_updated: u64,
+    pub blobs_planned: u64,
+    pub blobs_prepared: u64,
+    pub blob_read_bytes: u64,
     pub attachments_seen: u64,
     pub attachment_original_bytes: u64,
     pub exact_assets_seen: u64,
@@ -22,14 +27,22 @@ pub struct ImportMetrics {
     pub assetpack_new_objects: u64,
     pub canonical_assets_seen: u64,
     pub canonical_assets_new: u64,
+    pub parse_errors: u64,
+    pub blob_errors: u64,
+    pub write_errors: u64,
 }
 
 impl ImportMetrics {
     pub fn add(&mut self, other: &Self) {
         self.source_path_disk_bytes += other.source_path_disk_bytes;
+        self.chats_planned += other.chats_planned;
+        self.chats_parsed += other.chats_parsed;
         self.records_seen += other.records_seen;
         self.records_inserted += other.records_inserted;
         self.records_updated += other.records_updated;
+        self.blobs_planned += other.blobs_planned;
+        self.blobs_prepared += other.blobs_prepared;
+        self.blob_read_bytes += other.blob_read_bytes;
         self.attachments_seen += other.attachments_seen;
         self.attachment_original_bytes += other.attachment_original_bytes;
         self.exact_assets_seen += other.exact_assets_seen;
@@ -40,6 +53,9 @@ impl ImportMetrics {
         self.assetpack_new_objects += other.assetpack_new_objects;
         self.canonical_assets_seen += other.canonical_assets_seen;
         self.canonical_assets_new += other.canonical_assets_new;
+        self.parse_errors += other.parse_errors;
+        self.blob_errors += other.blob_errors;
+        self.write_errors += other.write_errors;
     }
 
     pub(super) fn add_write_outcome(&mut self, outcome: &WriteOutcome) {
@@ -47,6 +63,7 @@ impl ImportMetrics {
         self.records_updated += u64::from(outcome.record_updated);
         self.attachments_seen += outcome.attachments_seen as u64;
         self.attachment_original_bytes += outcome.attachment_original_bytes;
+        self.blob_read_bytes += outcome.attachment_original_bytes;
         for asset in &outcome.assets {
             self.exact_assets_seen += 1;
             self.exact_asset_original_bytes += asset.original_bytes;

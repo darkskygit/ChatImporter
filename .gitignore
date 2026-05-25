@@ -3,3 +3,4 @@
 *.db*
 .context
 *.md
+.DS_Store

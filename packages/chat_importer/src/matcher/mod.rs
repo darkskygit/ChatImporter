@@ -1,7 +1,6 @@
 mod ios_sms;
 mod ios_wc;
 mod report;
-mod utils;
 mod win_qq_html;
 mod win_qq_mht;
 
@@ -12,15 +11,39 @@ use lazy_static::lazy_static;
 pub use log::{debug, error, info, warn};
 use path_ext::PathExt;
 use regex::{Captures, Regex};
-use utils::{blob_dhash, hamming_distance};
 
-use crate::store::{Attachments, ChatStore, MetadataMerger, Record, RecordType};
+use crate::store::{Attachments, ChatStore, MetadataMerger, PreparedRecord, Record, RecordType};
 use assetpack_core::Hash32;
 use ibackuptool2::Backup;
 pub use report::{format_bytes, path_disk_bytes, ImportMetrics, ImportReport};
 
+#[derive(Clone, Debug, Default)]
+pub struct ImportPlan {
+    pub chats_total: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecordBatch {
+    pub label: String,
+    pub records: Vec<RecordType>,
+}
+
 pub trait MsgMatcher {
-    fn get_records(&self) -> Option<Vec<RecordType>>;
+    fn import_plan(&self) -> ImportPlan {
+        ImportPlan::default()
+    }
+
+    fn get_record_batches(&self, progress: &PipelineProgress) -> Result<Vec<RecordBatch>>;
+
+    #[cfg(test)]
+    fn collect_records(&self) -> Result<Vec<RecordType>> {
+        Ok(self
+            .get_record_batches(&PipelineProgress::hidden())?
+            .into_iter()
+            .flat_map(|batch| batch.records)
+            .collect())
+    }
+
     fn get_metadata_merger(&self) -> Option<Box<dyn MetadataMerger>> {
         None
     }
@@ -29,13 +52,16 @@ pub trait MsgMatcher {
 use anyhow::{Context, Result};
 use std::fs::read;
 use std::path::Path;
-
 #[allow(non_camel_case_types)]
 pub enum ExportType<P: AsRef<Path>> {
     WindowsQQ(P, String),
 }
 
-pub async fn exporter<P>(store: &mut ChatStore, export_type: ExportType<P>) -> Result<ImportReport>
+pub async fn exporter<P>(
+    store: &mut ChatStore,
+    progress: &MultiProgress,
+    export_type: ExportType<P>,
+) -> Result<ImportReport>
 where
     P: AsRef<Path>,
 {
@@ -50,21 +76,23 @@ where
                 .into(),
         )?,
     };
-    export_matcher(store, matcher.as_ref()).await
+    export_matcher(store, progress, matcher.as_ref()).await
 }
 
 pub async fn export_ios_wechat_backup(
     store: &mut ChatStore,
+    progress: &MultiProgress,
     backup: Backup,
     names: Option<Vec<String>>,
 ) -> Result<ImportReport> {
     info!("Importing unlocked backup: {}", backup.path.display());
     let matcher = ios_wc::Matcher::from_backup(backup, names)?;
-    export_matcher(store, matcher.as_ref()).await
+    export_matcher(store, progress, matcher.as_ref()).await
 }
 
 pub async fn export_ios_sms_backup(
     store: &mut ChatStore,
+    progress: &MultiProgress,
     backup: &Backup,
     owner_name: String,
     owner_id: Option<String>,
@@ -76,78 +104,157 @@ pub async fn export_ios_sms_backup(
     else {
         return Ok(ImportReport::skipped());
     };
-    export_matcher(store, matcher.as_ref()).await
+    export_matcher(store, progress, matcher.as_ref()).await
 }
 
 pub async fn export_matcher(
     store: &mut ChatStore,
+    progress_target: &MultiProgress,
     matcher: &dyn MsgMatcher,
 ) -> Result<ImportReport> {
-    let records = matcher.get_records().context("Cannot transfrom records")?;
-    let total = records.len();
+    let progress = PipelineProgress::new(progress_target, matcher.import_plan())?;
+    let records = matcher
+        .get_record_batches(&progress)
+        .context("Cannot transform records")?
+        .into_iter()
+        .flat_map(|batch| batch.records)
+        .collect::<Vec<_>>();
     let blob_total = records
         .iter()
         .map(RecordType::attachment_count)
         .sum::<usize>();
+    progress.set_prepare_total(blob_total as u64);
+    let prepared_records = prepare_records_parallel(records, &progress)?;
     let merger = matcher.get_metadata_merger();
-    let progress = PersistProgress::new(total as u64, blob_total as u64)?;
     let mut metrics = ImportMetrics {
-        records_seen: total as u64,
+        chats_planned: progress.chats_length(),
+        chats_parsed: progress.chats_position(),
+        records_seen: prepared_records.len() as u64,
+        blobs_planned: blob_total as u64,
+        blobs_prepared: blob_total as u64,
         ..Default::default()
     };
-    for (i, record) in records.into_iter().enumerate() {
+    progress.set_write_totals(prepared_records.len() as u64);
+    for (i, record) in prepared_records.into_iter().enumerate() {
         let display = record.display();
-        let blob_progress = progress.blobs.clone();
         let outcome = store
-            .insert_or_update_detailed(record, merger.as_deref(), || {
-                blob_progress.inc(1);
-            })
+            .insert_or_update_prepared_detailed(record, merger.as_deref(), || {})
             .await
             .context(format!("Cannot insert records: {}", display))?;
         metrics.add_write_outcome(&outcome);
-        progress.records.inc(1);
-        progress.records.set_message(format!("{}/{}", i + 1, total));
+        progress.record_written(i as u64 + 1, metrics.records_seen);
     }
     progress.finish();
     Ok(ImportReport::imported(metrics))
 }
 
-struct PersistProgress {
-    records: ProgressBar,
-    blobs: ProgressBar,
-    multi: MultiProgress,
+#[cfg(test)]
+pub(crate) fn test_progress() -> MultiProgress {
+    let progress = MultiProgress::new();
+    progress.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    progress
 }
 
-impl PersistProgress {
-    fn new(record_total: u64, blob_total: u64) -> Result<Self> {
-        let multi = MultiProgress::new();
+pub struct PipelineProgress {
+    parse: ProgressBar,
+    write: ProgressBar,
+    blobs: ProgressBar,
+    multi: MultiProgress,
+    hidden: bool,
+}
+
+impl PipelineProgress {
+    #[cfg(test)]
+    fn hidden() -> Self {
+        Self {
+            parse: ProgressBar::hidden(),
+            write: ProgressBar::hidden(),
+            blobs: ProgressBar::hidden(),
+            multi: MultiProgress::new(),
+            hidden: true,
+        }
+    }
+
+    fn new(progress: &MultiProgress, plan: ImportPlan) -> Result<Self> {
+        let multi = progress.clone();
         let style = ProgressStyle::with_template(
             "{prefix:>7} [{bar:40.cyan/blue}] {pos}/{len} {percent:>3}% {elapsed_precise} {msg}",
         )?
         .progress_chars("=> ");
-        let records = multi.add(ProgressBar::new(record_total));
-        records.set_style(style.clone());
-        records.set_prefix("chats");
-        let blobs = multi.add(ProgressBar::new(blob_total));
-        blobs.set_style(style);
-        blobs.set_prefix("blobs");
-        Ok(Self {
-            records,
+        let parse = multi.add(ProgressBar::new(plan.chats_total.unwrap_or(0)));
+        parse.set_style(style.clone());
+        parse.set_prefix("parse");
+        let blobs = multi.add(ProgressBar::new(0));
+        blobs.set_style(style.clone());
+        blobs.set_prefix("prepare");
+        let write = multi.add(ProgressBar::new(0));
+        write.set_style(style);
+        write.set_prefix("write");
+        let progress = Self {
+            parse,
+            write,
             blobs,
             multi,
-        })
+            hidden: false,
+        };
+        Ok(progress)
+    }
+
+    pub fn chat_planned(&self, n: u64) {
+        self.parse.set_length(n);
+    }
+
+    pub fn chat_parsed(&self, records: u64, blobs: u64) {
+        self.parse.inc(1);
+        self.parse
+            .set_message(format!("records={records} blobs={blobs}"));
+    }
+
+    pub fn set_prepare_total(&self, blobs: u64) {
+        self.blobs.set_length(blobs);
+        self.blobs.set_position(0);
+        self.blobs.set_message("preparing");
+    }
+
+    pub fn blob_prepared(&self, n: u64) {
+        self.blobs.inc(n);
+    }
+
+    pub fn set_write_totals(&self, records: u64) {
+        self.write.set_length(records);
+    }
+
+    pub fn record_written(&self, current: u64, total: u64) {
+        self.write.inc(1);
+        self.write.set_message(format!("{current}/{total}"));
+    }
+
+    pub fn chats_length(&self) -> u64 {
+        self.parse.length().unwrap_or(0)
+    }
+
+    pub fn chats_position(&self) -> u64 {
+        self.parse.position()
     }
 
     fn finish(self) {
-        self.records.finish_and_clear();
+        if self.hidden {
+            return;
+        }
+        self.parse.finish_and_clear();
+        self.write.finish_and_clear();
         self.blobs.finish_and_clear();
         self.multi.clear().ok();
     }
 }
 
-impl Drop for PersistProgress {
+impl Drop for PipelineProgress {
     fn drop(&mut self) {
-        self.records.finish_and_clear();
+        if self.hidden {
+            return;
+        }
+        self.parse.finish_and_clear();
+        self.write.finish_and_clear();
         self.blobs.finish_and_clear();
         self.multi.clear().ok();
     }
@@ -173,6 +280,87 @@ fn attachment_fingerprint(attachments: &Attachments) -> String {
         .collect::<Vec<_>>();
     hashes.sort();
     Hash32::sha3_256(hashes.join("\n").as_bytes()).to_hex()
+}
+
+fn record_blob_count(records: &[RecordType]) -> usize {
+    records.iter().map(RecordType::attachment_count).sum()
+}
+
+fn prepare_records_parallel(
+    records: Vec<RecordType>,
+    progress: &PipelineProgress,
+) -> Result<Vec<PreparedRecord>> {
+    if records.len() <= 1 {
+        return records
+            .into_iter()
+            .map(|record| {
+                let attachments = record.attachment_count() as u64;
+                let prepared = ChatStore::prepare_record(record)?;
+                progress.blob_prepared(attachments);
+                Ok(prepared)
+            })
+            .collect();
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .min(records.len());
+    let jobs = std::sync::Arc::new(std::sync::Mutex::new(
+        records
+            .into_iter()
+            .enumerate()
+            .collect::<std::collections::VecDeque<_>>(),
+    ));
+    let prepared =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, PreparedRecord)>::new()));
+    let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<anyhow::Error>::new()));
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let jobs = std::sync::Arc::clone(&jobs);
+            let prepared = std::sync::Arc::clone(&prepared);
+            let errors = std::sync::Arc::clone(&errors);
+            scope.spawn(move || loop {
+                let Some((index, record)) = jobs
+                    .lock()
+                    .expect("record prepare job queue poisoned")
+                    .pop_front()
+                else {
+                    break;
+                };
+                let attachments = record.attachment_count() as u64;
+                match ChatStore::prepare_record(record) {
+                    Ok(record) => {
+                        progress.blob_prepared(attachments);
+                        prepared
+                            .lock()
+                            .expect("record prepare result queue poisoned")
+                            .push((index, record));
+                    }
+                    Err(error) => errors
+                        .lock()
+                        .expect("record prepare error queue poisoned")
+                        .push(error),
+                }
+            });
+        }
+    });
+
+    let errors = std::sync::Arc::try_unwrap(errors)
+        .map_err(|_| anyhow::anyhow!("record prepare error queue still shared"))?
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("record prepare error queue poisoned"))?;
+    if let Some(error) = errors.into_iter().next() {
+        return Err(error);
+    }
+
+    let mut prepared = std::sync::Arc::try_unwrap(prepared)
+        .map_err(|_| anyhow::anyhow!("record prepare result queue still shared"))?
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("record prepare result queue poisoned"))?;
+    prepared.sort_by_key(|(index, _)| *index);
+    Ok(prepared.into_iter().map(|(_, record)| record).collect())
 }
 
 fn modify_timestamp(record_type: RecordType, near_sec: Option<i64>) -> Option<RecordType> {
@@ -211,8 +399,21 @@ mod tests {
     }
 
     impl MsgMatcher for TestMatcher {
-        fn get_records(&self) -> Option<Vec<RecordType>> {
-            Some(self.records.clone())
+        fn import_plan(&self) -> ImportPlan {
+            ImportPlan {
+                chats_total: Some(1),
+            }
+        }
+
+        fn get_record_batches(&self, progress: &PipelineProgress) -> Result<Vec<RecordBatch>> {
+            progress.chat_parsed(
+                self.records.len() as u64,
+                record_blob_count(&self.records) as u64,
+            );
+            Ok(vec![RecordBatch {
+                label: "test".into(),
+                records: self.records.clone(),
+            }])
         }
     }
 
@@ -266,10 +467,16 @@ mod tests {
             .await
             .unwrap();
 
-        let report =
-            export_ios_sms_backup(&mut store, &backup, "Owner".into(), None, "backup-1".into())
-                .await
-                .unwrap();
+        let report = export_ios_sms_backup(
+            &mut store,
+            &test_progress(),
+            &backup,
+            "Owner".into(),
+            None,
+            "backup-1".into(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.disposition, CandidateDisposition::Skipped);
     }
@@ -291,6 +498,7 @@ mod tests {
         let attachment = b"asset bytes".to_vec();
         let report = export_matcher(
             &mut store,
+            &test_progress(),
             &TestMatcher {
                 records: vec![RecordType::from((
                     record,

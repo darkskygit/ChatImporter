@@ -20,7 +20,7 @@ use store::ChatStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_logger(get_log_level().to_level_filter())?;
+    let progress = init_logger(get_log_level().to_level_filter())?;
     let mut store = ChatStore::open("record.db").await?;
     let paths = get_paths();
     match get_cmd() {
@@ -30,7 +30,13 @@ async fn main() -> Result<()> {
             let mut failed = 0usize;
             for path in paths {
                 info!("Processing: {}", path.display());
-                match exporter(&mut store, ExportType::WindowsQQ(&path, owner.into())).await {
+                match exporter(
+                    &mut store,
+                    &progress,
+                    ExportType::WindowsQQ(&path, owner.into()),
+                )
+                .await
+                {
                     Ok(mut report) => {
                         report.metrics.source_path_disk_bytes = path_disk_bytes(&path);
                         log_import_report(&path, &report);
@@ -69,27 +75,30 @@ async fn main() -> Result<()> {
                             &path,
                             &mut password_manager,
                         ) {
-                            Ok(UnlockDecision::Unlocked(backup)) => {
-                                match export_ios_wechat_backup(&mut store, *backup, names.clone())
-                                    .await
-                                {
-                                    Ok(report) => record_import_report(
-                                        &mut session,
-                                        &mut total_metrics,
-                                        report,
-                                        &candidate.display_path,
-                                    ),
-                                    Err(error) => {
-                                        warn!(
-                                            "failed to import backup candidate {} ({}): {}",
-                                            candidate.source_id,
-                                            candidate.display_path.display(),
-                                            error
-                                        );
-                                        session.mark_failed();
-                                    }
+                            Ok(UnlockDecision::Unlocked(backup)) => match export_ios_wechat_backup(
+                                &mut store,
+                                &progress,
+                                *backup,
+                                names.clone(),
+                            )
+                            .await
+                            {
+                                Ok(report) => record_import_report(
+                                    &mut session,
+                                    &mut total_metrics,
+                                    report,
+                                    &candidate.display_path,
+                                ),
+                                Err(error) => {
+                                    warn!(
+                                        "failed to import backup candidate {} ({}): {}",
+                                        candidate.source_id,
+                                        candidate.display_path.display(),
+                                        error
+                                    );
+                                    session.mark_failed();
                                 }
-                            }
+                            },
                             Ok(UnlockDecision::Skip) => session.mark_skipped(),
                             Err(error) => {
                                 warn!(
@@ -117,6 +126,7 @@ async fn main() -> Result<()> {
                                         Ok(UnlockDecision::Unlocked(backup)) => {
                                             match export_ios_wechat_backup(
                                                 &mut store,
+                                                &progress,
                                                 *backup,
                                                 names.clone(),
                                             )
@@ -190,6 +200,7 @@ async fn main() -> Result<()> {
                             Ok(UnlockDecision::Unlocked(backup)) => {
                                 match export_ios_sms_backup(
                                     &mut store,
+                                    &progress,
                                     backup.as_ref(),
                                     owner.into(),
                                     owner_id.clone(),
@@ -241,6 +252,7 @@ async fn main() -> Result<()> {
                                         Ok(UnlockDecision::Unlocked(backup)) => {
                                             match export_ios_sms_backup(
                                                 &mut store,
+                                                &progress,
                                                 backup.as_ref(),
                                                 owner.clone(),
                                                 owner_id.clone(),
@@ -329,17 +341,25 @@ fn log_import_report(path: &Path, report: &ImportReport) {
 
 fn metrics_summary(metrics: &ImportMetrics) -> String {
     format!(
-        "path_size={}, records_seen={}, inserted={}, updated={}, blobs_seen={}, blob_original={}, exact_assets_new={}, assetpack_estimated={}, assetpack_new={}, assetpack_new_objects={}, canonical_assets_new={}",
+        "path_size={}, chats={}/{}, records_seen={}, inserted={}, updated={}, blobs={}/{}, attachments_seen={}, blob_read={}, blob_original={}, exact_assets_new={}, assetpack_estimated={}, assetpack_new={}, assetpack_new_objects={}, canonical_assets_new={}, errors=parse:{}/blob:{}/write:{}",
         format_bytes(metrics.source_path_disk_bytes),
+        metrics.chats_parsed,
+        metrics.chats_planned,
         metrics.records_seen,
         metrics.records_inserted,
         metrics.records_updated,
+        metrics.blobs_prepared,
+        metrics.blobs_planned,
         metrics.attachments_seen,
+        format_bytes(metrics.blob_read_bytes),
         format_bytes(metrics.attachment_original_bytes),
         metrics.exact_assets_new,
         format_bytes(metrics.assetpack_estimated_bytes),
         format_bytes(metrics.assetpack_new_stored_bytes),
         metrics.assetpack_new_objects,
         metrics.canonical_assets_new,
+        metrics.parse_errors,
+        metrics.blob_errors,
+        metrics.write_errors,
     )
 }

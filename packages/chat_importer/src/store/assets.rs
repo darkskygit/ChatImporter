@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
@@ -19,6 +19,17 @@ pub(super) struct StoredAsset {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct PreparedAsset {
+    pub(super) name: String,
+    pub(super) original_hash: Hash32,
+    objects: Vec<ObjectRecord>,
+    recipe_hash: Hash32,
+    metadata: AssetMetadata,
+    estimated_stored_bytes: u64,
+    original_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
 struct AssetMetadata {
     media_kind: String,
     byte_size: i64,
@@ -26,6 +37,7 @@ struct AssetMetadata {
     height: Option<i64>,
     duration_ms: Option<i64>,
     perceptual_hash: Option<String>,
+    perceptual_hash64: Option<u64>,
     quality_score: i64,
     algorithm: String,
 }
@@ -37,6 +49,143 @@ struct AssetCandidate {
     width: Option<i64>,
     height: Option<i64>,
     perceptual_hash: Option<String>,
+}
+
+#[derive(Default)]
+pub(super) struct ImageCandidateIndex {
+    buckets: HashMap<i64, Vec<ImageIndexCandidate>>,
+}
+
+#[derive(Clone, Debug)]
+struct ImageIndexCandidate {
+    asset_hash: Vec<u8>,
+    cluster_id: i64,
+    width: i64,
+    height: i64,
+    perceptual_hash64: u64,
+}
+
+impl ImageCandidateIndex {
+    pub(super) async fn load(pool: &sqlx::SqlitePool) -> Result<Self> {
+        let rows = sqlx::query_as::<_, AssetCandidate>(
+            r#"
+            SELECT asset_hash, cluster_id, width, height, perceptual_hash, quality_score
+            FROM chat_assets
+            WHERE media_kind = 'image'
+              AND perceptual_hash IS NOT NULL
+              AND width IS NOT NULL
+              AND height IS NOT NULL
+              AND height > 0
+              AND cluster_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+        let mut index = Self::default();
+        for row in rows {
+            index.insert_candidate(row);
+        }
+        Ok(index)
+    }
+
+    fn insert_candidate(&mut self, candidate: AssetCandidate) {
+        let (Some(cluster_id), Some(width), Some(height), Some(perceptual_hash)) = (
+            candidate.cluster_id,
+            candidate.width,
+            candidate.height,
+            candidate.perceptual_hash.as_deref(),
+        ) else {
+            return;
+        };
+        let Some(perceptual_hash64) = parse_dhash64(perceptual_hash) else {
+            return;
+        };
+        if height <= 0 {
+            return;
+        }
+        let candidate = ImageIndexCandidate {
+            asset_hash: candidate.asset_hash,
+            cluster_id,
+            width,
+            height,
+            perceptual_hash64,
+        };
+        self.buckets
+            .entry(aspect_bucket(width, height))
+            .or_default()
+            .push(candidate);
+    }
+
+    fn matching(&self, metadata: &AssetMetadata) -> Vec<AssetCandidate> {
+        let (Some(width), Some(height), Some(perceptual_hash64)) =
+            (metadata.width, metadata.height, metadata.perceptual_hash64)
+        else {
+            return Vec::new();
+        };
+        if height <= 0 {
+            return Vec::new();
+        }
+        let mut matching = Vec::new();
+        let center = aspect_bucket(width, height);
+        for bucket in (center - ASPECT_BUCKET_WINDOW)..=(center + ASPECT_BUCKET_WINDOW) {
+            let Some(candidates) = self.buckets.get(&bucket) else {
+                continue;
+            };
+            for candidate in candidates {
+                if image_index_candidate_matches(candidate, width, height, perceptual_hash64) {
+                    matching.push(AssetCandidate {
+                        asset_hash: candidate.asset_hash.clone(),
+                        cluster_id: Some(candidate.cluster_id),
+                        width: Some(candidate.width),
+                        height: Some(candidate.height),
+                        perceptual_hash: None,
+                    });
+                }
+            }
+        }
+        matching
+    }
+
+    fn upsert(&mut self, asset_hash: Hash32, cluster_id: i64, metadata: &AssetMetadata) {
+        let (Some(width), Some(height), Some(perceptual_hash64)) =
+            (metadata.width, metadata.height, metadata.perceptual_hash64)
+        else {
+            return;
+        };
+        if height <= 0 {
+            return;
+        }
+        let bucket = aspect_bucket(width, height);
+        let asset_hash = asset_hash.as_bytes().to_vec();
+        let candidates = self.buckets.entry(bucket).or_default();
+        if let Some(candidate) = candidates
+            .iter_mut()
+            .find(|candidate| candidate.asset_hash == asset_hash)
+        {
+            candidate.cluster_id = cluster_id;
+            candidate.width = width;
+            candidate.height = height;
+            candidate.perceptual_hash64 = perceptual_hash64;
+            return;
+        }
+        candidates.push(ImageIndexCandidate {
+            asset_hash,
+            cluster_id,
+            width,
+            height,
+            perceptual_hash64,
+        });
+    }
+
+    fn merge_clusters(&mut self, from: i64, to: i64) {
+        for candidates in self.buckets.values_mut() {
+            for candidate in candidates {
+                if candidate.cluster_id == from {
+                    candidate.cluster_id = to;
+                }
+            }
+        }
+    }
 }
 
 impl ChatStore {
@@ -52,16 +201,18 @@ impl ChatStore {
         self.get_asset_from_recipe(hash).await
     }
 
+    #[cfg(test)]
     pub(super) async fn put_asset_tx(
         &self,
         tx: &mut StoreWriteTx<'_>,
         name: &str,
         bytes: &[u8],
     ) -> Result<StoredAsset> {
-        self.put_asset_with_config_tx(tx, name, bytes, FileTransformConfig::default(), None)
-            .await
+        let prepared = prepare_asset(name, bytes, FileTransformConfig::default(), None)?;
+        self.put_prepared_asset_tx(tx, &prepared).await
     }
 
+    #[cfg(test)]
     async fn put_asset_with_config_tx(
         &self,
         tx: &mut StoreWriteTx<'_>,
@@ -70,76 +221,39 @@ impl ChatStore {
         config: FileTransformConfig,
         extension: Option<String>,
     ) -> Result<StoredAsset> {
-        let original_hash = Hash32::sha3_256(bytes);
+        let prepared = prepare_asset(name, bytes, config, extension)?;
+        self.put_prepared_asset_tx(tx, &prepared).await
+    }
+
+    pub(super) async fn put_prepared_asset_tx(
+        &self,
+        tx: &mut StoreWriteTx<'_>,
+        prepared: &PreparedAsset,
+    ) -> Result<StoredAsset> {
         let exact_asset_new = self
-            .existing_asset_canonical_tx(tx, original_hash)
+            .existing_asset_canonical_tx(tx, prepared.original_hash)
             .await?
             .is_none();
-        let extension = extension.or_else(|| extension_from_name(name));
-        let specs = assetpack_transform_precomp2::default_specs();
-        let selector = TransformSelector::new(config.clone(), config.temp_dir.clone(), specs);
-        let hint = FileHint {
-            size: bytes.len() as u64,
-            extension: extension.clone(),
-            head: Some(bytes.iter().copied().take(64).collect()),
-        };
-        let pipeline = Pipeline::new(PipelineConfig {
-            splitter: FastCdcSplitter::v1_defaults(),
-            ..Default::default()
-        });
-        let plan = pipeline.run(bytes.to_vec(), &hint, original_hash, Some(&selector))?;
-        let mut objects = Vec::with_capacity(plan.chunks.len() + 1);
-        let recipe_chunks = plan
-            .chunks
-            .iter()
-            .map(|chunk| (chunk.hash, chunk.raw_len))
-            .collect::<Vec<_>>();
-        for chunk in &plan.chunks {
-            let payload = chunk
-                .payload
-                .as_ref()
-                .ok_or_else(|| anyhow!("asset pipeline chunk payload was discarded"))?;
-            objects.push(ObjectRecord {
-                hash: chunk.hash,
-                kind: ObjectKind::Chunk,
-                size: chunk.raw_len as u64,
-                codec: chunk.codec,
-                content: payload.clone(),
-            });
-        }
-        let recipe = build_recipe(
-            plan.original_size,
-            &recipe_chunks,
-            plan.original_hash,
-            plan.transform_id,
-            plan.transform_version,
-        );
-        let recipe_hash = Hash32::sha3_256(&recipe);
-        objects.push(ObjectRecord {
-            hash: recipe_hash,
-            kind: ObjectKind::Recipe,
-            size: recipe.len() as u64,
-            codec: Codec::Raw,
-            content: recipe,
-        });
-        let (new_objects, new_stored_bytes) = self.new_object_stats_tx(tx, &objects).await?;
-        self.assets.put_objects_batch_tx(tx, &objects).await?;
+        let (new_objects, new_stored_bytes) =
+            self.new_object_stats_tx(tx, &prepared.objects).await?;
         self.assets
-            .put_file_recipe_cache_batch_tx(tx, &[(original_hash, recipe_hash)])
+            .put_objects_batch_tx(tx, &prepared.objects)
             .await?;
-        let metadata = analyze_asset(name, bytes, extension.as_deref());
+        self.assets
+            .put_file_recipe_cache_batch_tx(tx, &[(prepared.original_hash, prepared.recipe_hash)])
+            .await?;
         let canonical_asset_hash = self
-            .upsert_asset_metadata_tx(tx, original_hash, &metadata)
+            .upsert_asset_metadata_tx(tx, prepared.original_hash, &prepared.metadata)
             .await?;
-        let canonical_asset_new = canonical_asset_hash == original_hash && exact_asset_new;
+        let canonical_asset_new = canonical_asset_hash == prepared.original_hash && exact_asset_new;
         Ok(StoredAsset {
-            asset_hash: original_hash,
+            asset_hash: prepared.original_hash,
             canonical_asset_hash,
             outcome: AssetWriteOutcome {
-                asset_hash: original_hash.as_bytes().to_vec(),
+                asset_hash: prepared.original_hash.as_bytes().to_vec(),
                 canonical_asset_hash: canonical_asset_hash.as_bytes().to_vec(),
-                original_bytes: bytes.len() as u64,
-                estimated_stored_bytes: plan.estimated_bytes,
+                original_bytes: prepared.original_bytes,
+                estimated_stored_bytes: prepared.estimated_stored_bytes,
                 new_stored_bytes,
                 new_objects,
                 exact_asset_new,
@@ -293,19 +407,17 @@ impl ChatStore {
         asset_hash: Hash32,
         metadata: &AssetMetadata,
     ) -> Result<Hash32> {
-        let candidates = self.image_candidates_tx(tx).await?;
-        let matching = candidates
-            .into_iter()
-            .filter(|candidate| image_candidate_matches(candidate, metadata))
-            .collect::<Vec<_>>();
-        let cluster_id = if matching.is_empty() {
-            self.create_asset_cluster_tx(
-                tx,
-                metadata,
-                asset_hash,
-                metadata.perceptual_hash.as_deref(),
-            )
-            .await?
+        let matching = self.image_candidates.lock().await.matching(metadata);
+        let (cluster_id, other_clusters) = if matching.is_empty() {
+            let cluster_id = self
+                .create_asset_cluster_tx(
+                    tx,
+                    metadata,
+                    asset_hash,
+                    metadata.perceptual_hash.as_deref(),
+                )
+                .await?;
+            (cluster_id, Vec::new())
         } else {
             let cluster_id = matching
                 .iter()
@@ -317,21 +429,32 @@ impl ChatStore {
                 .filter_map(|candidate| candidate.cluster_id)
                 .filter(|id| *id != cluster_id)
                 .collect::<Vec<_>>();
-            for other_cluster in other_clusters {
+            for other_cluster in &other_clusters {
                 sqlx::query("UPDATE chat_assets SET cluster_id = ?1 WHERE cluster_id = ?2")
                     .bind(cluster_id)
-                    .bind(other_cluster)
+                    .bind(*other_cluster)
                     .execute(&mut **tx)
                     .await?;
             }
-            cluster_id
+            (cluster_id, other_clusters)
         };
         self.upsert_chat_asset_tx(tx, asset_hash, cluster_id, metadata, asset_hash, "self")
             .await?;
         let canonical_asset_hash = self
             .set_cluster_canonical_tx(tx, cluster_id, asset_hash, metadata)
             .await?;
+        let mut index = self.image_candidates.lock().await;
+        for other_cluster in other_clusters {
+            index.merge_clusters(other_cluster, cluster_id);
+        }
+        index.upsert(asset_hash, cluster_id, metadata);
         Ok(canonical_asset_hash)
+    }
+
+    pub(super) async fn reload_image_candidates(&self) -> Result<()> {
+        let index = ImageCandidateIndex::load(&self.pool).await?;
+        *self.image_candidates.lock().await = index;
+        Ok(())
     }
 
     async fn create_asset_cluster_tx(
@@ -406,18 +529,6 @@ impl ChatStore {
         .execute(&mut **tx)
         .await?;
         Ok(())
-    }
-
-    async fn image_candidates_tx(&self, tx: &mut StoreWriteTx<'_>) -> Result<Vec<AssetCandidate>> {
-        Ok(sqlx::query_as::<_, AssetCandidate>(
-            r#"
-            SELECT asset_hash, cluster_id, width, height, perceptual_hash, quality_score
-            FROM chat_assets
-            WHERE media_kind = 'image' AND perceptual_hash IS NOT NULL
-            "#,
-        )
-        .fetch_all(&mut **tx)
-        .await?)
     }
 
     async fn set_cluster_canonical_tx(
@@ -495,6 +606,71 @@ impl ChatStore {
     }
 }
 
+pub(super) fn prepare_asset(
+    name: &str,
+    bytes: &[u8],
+    config: FileTransformConfig,
+    extension: Option<String>,
+) -> Result<PreparedAsset> {
+    let original_hash = Hash32::sha3_256(bytes);
+    let extension = extension.or_else(|| extension_from_name(name));
+    let specs = assetpack_transform_precomp2::default_specs();
+    let selector = TransformSelector::new(config.clone(), config.temp_dir.clone(), specs);
+    let hint = FileHint {
+        size: bytes.len() as u64,
+        extension: extension.clone(),
+        head: Some(bytes.iter().copied().take(64).collect()),
+    };
+    let pipeline = Pipeline::new(PipelineConfig {
+        splitter: FastCdcSplitter::v1_defaults(),
+        ..Default::default()
+    });
+    let plan = pipeline.run(bytes.to_vec(), &hint, original_hash, Some(&selector))?;
+    let mut objects = Vec::with_capacity(plan.chunks.len() + 1);
+    let recipe_chunks = plan
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.hash, chunk.raw_len))
+        .collect::<Vec<_>>();
+    for chunk in &plan.chunks {
+        let payload = chunk
+            .payload
+            .as_ref()
+            .ok_or_else(|| anyhow!("asset pipeline chunk payload was discarded"))?;
+        objects.push(ObjectRecord {
+            hash: chunk.hash,
+            kind: ObjectKind::Chunk,
+            size: chunk.raw_len as u64,
+            codec: chunk.codec,
+            content: payload.clone(),
+        });
+    }
+    let recipe = build_recipe(
+        plan.original_size,
+        &recipe_chunks,
+        plan.original_hash,
+        plan.transform_id,
+        plan.transform_version,
+    );
+    let recipe_hash = Hash32::sha3_256(&recipe);
+    objects.push(ObjectRecord {
+        hash: recipe_hash,
+        kind: ObjectKind::Recipe,
+        size: recipe.len() as u64,
+        codec: Codec::Raw,
+        content: recipe,
+    });
+    Ok(PreparedAsset {
+        name: name.into(),
+        original_hash,
+        objects,
+        recipe_hash,
+        metadata: analyze_asset(name, bytes, extension.as_deref()),
+        estimated_stored_bytes: plan.estimated_bytes,
+        original_bytes: bytes.len() as u64,
+    })
+}
+
 fn analyze_asset(name: &str, bytes: &[u8], extension: Option<&str>) -> AssetMetadata {
     let inferred_extension;
     let extension = match extension {
@@ -521,6 +697,7 @@ fn analyze_asset(name: &str, bytes: &[u8], extension: Option<&str>) -> AssetMeta
             height: Some(height),
             duration_ms: None,
             perceptual_hash: Some(format!("{hash:016x}")),
+            perceptual_hash64: Some(hash),
             quality_score,
             algorithm: "dhash64".into(),
         };
@@ -537,6 +714,7 @@ fn analyze_asset(name: &str, bytes: &[u8], extension: Option<&str>) -> AssetMeta
         height: None,
         duration_ms: None,
         perceptual_hash: None,
+        perceptual_hash64: None,
         quality_score: bytes.len() as i64,
         algorithm: "none".into(),
     }
@@ -563,35 +741,23 @@ fn is_likely_thumbnail_name(name: &str) -> bool {
         .any(|needle| name.contains(needle))
 }
 
-fn image_candidate_matches(candidate: &AssetCandidate, metadata: &AssetMetadata) -> bool {
-    let (Some(candidate_hash), Some(new_hash)) = (
-        candidate.perceptual_hash.as_deref(),
-        metadata.perceptual_hash.as_deref(),
-    ) else {
-        return false;
-    };
-    if hamming_hex_u64(candidate_hash, new_hash).unwrap_or(u32::MAX) > 10 {
+const IMAGE_HAMMING_THRESHOLD: u32 = 10;
+const ASPECT_BUCKET_SCALE: f64 = 100.0;
+const ASPECT_BUCKET_WINDOW: i64 = 9;
+
+fn image_index_candidate_matches(
+    candidate: &ImageIndexCandidate,
+    width: i64,
+    height: i64,
+    perceptual_hash64: u64,
+) -> bool {
+    if hamming_u64(candidate.perceptual_hash64, perceptual_hash64) > IMAGE_HAMMING_THRESHOLD {
         return false;
     }
-    aspect_close(
-        candidate.width,
-        candidate.height,
-        metadata.width,
-        metadata.height,
-    )
+    aspect_close(candidate.width, candidate.height, width, height)
 }
 
-fn aspect_close(
-    left_width: Option<i64>,
-    left_height: Option<i64>,
-    right_width: Option<i64>,
-    right_height: Option<i64>,
-) -> bool {
-    let (Some(lw), Some(lh), Some(rw), Some(rh)) =
-        (left_width, left_height, right_width, right_height)
-    else {
-        return false;
-    };
+fn aspect_close(lw: i64, lh: i64, rw: i64, rh: i64) -> bool {
     if lh == 0 || rh == 0 {
         return false;
     }
@@ -601,10 +767,16 @@ fn aspect_close(
         && ((left - right).abs() / left.max(right)) <= 0.08
 }
 
-fn hamming_hex_u64(left: &str, right: &str) -> Option<u32> {
-    let left = u64::from_str_radix(left, 16).ok()?;
-    let right = u64::from_str_radix(right, 16).ok()?;
-    Some((left ^ right).count_ones())
+fn aspect_bucket(width: i64, height: i64) -> i64 {
+    ((width as f64 / height as f64) * ASPECT_BUCKET_SCALE).round() as i64
+}
+
+fn parse_dhash64(hash: &str) -> Option<u64> {
+    u64::from_str_radix(hash, 16).ok()
+}
+
+fn hamming_u64(left: u64, right: u64) -> u32 {
+    (left ^ right).count_ones()
 }
 
 fn dhash64(gray: &image::GrayImage) -> u64 {
@@ -841,6 +1013,46 @@ mod tests {
         assert_eq!(canonicals.len(), 2);
         for canonical in canonicals {
             assert_eq!(Hash32::from_bytes(&canonical).unwrap(), high_hash);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_candidate_index_loads_existing_assets_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("record.db");
+        let low = png_bytes(2, 2, |_, _| 120);
+        let high = png_bytes(8, 8, |_, _| 120);
+        {
+            let store = ChatStore::open(&db_path).await.unwrap();
+            let mut tx = store.pool.begin().await.unwrap();
+            store.put_asset_tx(&mut tx, "low.png", &low).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        let store = ChatStore::open(&db_path).await.unwrap();
+        let mut tx = store.pool.begin().await.unwrap();
+        let high_asset = store
+            .put_asset_tx(&mut tx, "high.png", &high)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let clusters: i64 =
+            sqlx::query_scalar("SELECT COUNT(DISTINCT cluster_id) FROM chat_assets")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(clusters, 1);
+        let canonicals: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT canonical_asset_hash FROM chat_assets")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        for canonical in canonicals {
+            assert_eq!(
+                Hash32::from_bytes(&canonical).unwrap(),
+                high_asset.asset_hash
+            );
         }
     }
 

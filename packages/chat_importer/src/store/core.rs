@@ -8,13 +8,15 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
-use super::{schema, Attachments, Record, INDEX_NAME};
+use super::assets::ImageCandidateIndex;
+use super::{schema, Record, INDEX_NAME};
 
 pub struct ChatStore {
     pub(super) pool: SqlitePool,
     pub(super) assets: SqliteStore,
     pub(super) index: InMemoryIndex,
     pub(super) pending_assets: Mutex<HashMap<Hash32, Vec<u8>>>,
+    pub(super) image_candidates: Mutex<ImageCandidateIndex>,
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -74,27 +76,29 @@ impl ChatStore {
             .await?;
         schema::init(&pool).await?;
         let assets = SqliteStore::from_pool(pool.clone()).await?;
+        let image_candidates = ImageCandidateIndex::load(&pool).await?;
         let mut store = Self {
             pool,
             assets,
             index: InMemoryIndex::default(),
             pending_assets: Mutex::new(HashMap::new()),
+            image_candidates: Mutex::new(image_candidates),
         };
         store.rebuild_index().await?;
         Ok(store)
     }
 
-    pub(super) async fn set_pending_assets(&self, attachments: &Attachments) {
+    pub(super) async fn set_pending_assets(&self, assets: &[(Hash32, Vec<u8>)]) {
         let mut pending = self.pending_assets.lock().await;
-        for bytes in attachments.values() {
-            pending.insert(Hash32::sha3_256(bytes), bytes.clone());
+        for (hash, bytes) in assets {
+            pending.insert(*hash, bytes.clone());
         }
     }
 
-    pub(super) async fn clear_pending_assets(&self, attachments: &Attachments) {
+    pub(super) async fn clear_pending_assets(&self, hashes: &[Hash32]) {
         let mut pending = self.pending_assets.lock().await;
-        for bytes in attachments.values() {
-            pending.remove(&Hash32::sha3_256(bytes));
+        for hash in hashes {
+            pending.remove(hash);
         }
     }
 

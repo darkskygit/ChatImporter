@@ -1,9 +1,25 @@
 use anyhow::Result;
+use assetpack_core::FileTransformConfig;
 use assetpack_core::{Hash32, StoreWriteTx};
 use chrono::Utc;
 
+use super::assets::{prepare_asset, PreparedAsset};
 use super::core::StoredRecord;
 use super::{ChatStore, MetadataMerger, Record, RecordType, WriteOutcome};
+
+pub struct PreparedRecord {
+    record: Record,
+    attachments: super::Attachments,
+    prepared_assets: Vec<PreparedAsset>,
+    attachments_seen: usize,
+    attachment_original_bytes: u64,
+}
+
+impl PreparedRecord {
+    pub fn display(&self) -> String {
+        self.record.display()
+    }
+}
 
 impl ChatStore {
     // Compatibility wrapper for callers that only need inserted/updated success, while import
@@ -23,30 +39,84 @@ impl ChatStore {
         &mut self,
         record: RecordType,
         merger: Option<&dyn MetadataMerger>,
-        mut on_asset_written: F,
+        on_asset_written: F,
     ) -> Result<WriteOutcome>
     where
         F: FnMut(),
     {
-        let (mut record, attachments) = record.into_parts();
+        let prepared = Self::prepare_record(record)?;
+        self.insert_or_update_prepared_detailed(prepared, merger, on_asset_written)
+            .await
+    }
+
+    pub fn prepare_record(record: RecordType) -> Result<PreparedRecord> {
+        let (record, attachments) = record.into_parts();
         let attachments_seen = attachments.len();
         let attachment_original_bytes = attachments
             .values()
             .map(|bytes| bytes.len() as u64)
             .sum::<u64>();
+        let prepared_assets = prepare_attachments(&attachments)?;
+        Ok(PreparedRecord {
+            record,
+            attachments,
+            prepared_assets,
+            attachments_seen,
+            attachment_original_bytes,
+        })
+    }
+
+    pub async fn insert_or_update_prepared_detailed<F>(
+        &mut self,
+        prepared: PreparedRecord,
+        merger: Option<&dyn MetadataMerger>,
+        mut on_asset_written: F,
+    ) -> Result<WriteOutcome>
+    where
+        F: FnMut(),
+    {
+        let PreparedRecord {
+            mut record,
+            attachments,
+            prepared_assets,
+            attachments_seen,
+            attachment_original_bytes,
+        } = prepared;
         let old = self.find_existing(&record).await?;
         let record_inserted = old.is_none();
         let record_updated = old.is_some();
+        let pending_assets = prepared_assets
+            .iter()
+            .filter_map(|asset| {
+                attachments
+                    .get(&asset.name)
+                    .map(|bytes| (asset.original_hash, bytes.clone()))
+            })
+            .collect::<Vec<_>>();
+        let pending_hashes = pending_assets
+            .iter()
+            .map(|(hash, _)| *hash)
+            .collect::<Vec<_>>();
         let mut tx = self.pool.begin().await?;
-        let mut asset_hashes = Vec::with_capacity(attachments.len());
-        let mut asset_outcomes = Vec::with_capacity(attachments.len());
-        for (name, bytes) in &attachments {
-            let asset = self.put_asset_tx(&mut tx, name, bytes).await?;
-            asset_hashes.push((name.clone(), asset.asset_hash, asset.canonical_asset_hash));
+        let mut asset_hashes = Vec::with_capacity(prepared_assets.len());
+        let mut asset_outcomes = Vec::with_capacity(prepared_assets.len());
+        for prepared in &prepared_assets {
+            let asset = match self.put_prepared_asset_tx(&mut tx, prepared).await {
+                Ok(asset) => asset,
+                Err(error) => {
+                    let _ = self.reload_image_candidates().await;
+                    return Err(error);
+                }
+            };
+            asset_hashes.push((
+                prepared.name.clone(),
+                asset.asset_hash,
+                asset.canonical_asset_hash,
+            ));
             asset_outcomes.push(asset.outcome);
             on_asset_written();
         }
-        self.set_pending_assets(&attachments).await;
+        self.set_pending_assets(&pending_assets).await;
         let result = async {
             record.metadata = match (
                 old.as_ref().and_then(|r| r.metadata.clone()),
@@ -84,7 +154,10 @@ impl ChatStore {
             Ok::<_, anyhow::Error>((record_id, record))
         }
         .await;
-        self.clear_pending_assets(&attachments).await;
+        self.clear_pending_assets(&pending_hashes).await;
+        if result.is_err() {
+            let _ = self.reload_image_candidates().await;
+        }
         let (record_id, mut record) = result?;
         record.id = Some(record_id);
         self.index_record(&record);
@@ -244,4 +317,13 @@ impl ChatStore {
         .await?;
         Ok(())
     }
+}
+
+fn prepare_attachments(attachments: &super::Attachments) -> Result<Vec<PreparedAsset>> {
+    let mut prepared = attachments
+        .iter()
+        .map(|(name, bytes)| prepare_asset(name, bytes, FileTransformConfig::default(), None))
+        .collect::<Result<Vec<_>>>()?;
+    prepared.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(prepared)
 }

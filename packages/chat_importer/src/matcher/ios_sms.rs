@@ -271,27 +271,43 @@ impl Extractor {
 }
 
 impl MsgMatcher for Extractor {
-    fn get_records(&self) -> Option<Vec<RecordType>> {
-        self.get_conversations()
-            .map(|conversations| {
-                conversations
-                    .iter()
-                    .filter_map(|conversation| {
-                        self.get_record_lines(conversation)
-                            .map_err(|e| {
-                                warn!(
-                                    "Failed to get sms conversation {}: {}",
-                                    conversation.rowid, e
-                                )
-                            })
-                            .ok()
+    fn import_plan(&self) -> ImportPlan {
+        ImportPlan {
+            chats_total: self
+                .get_conversations()
+                .ok()
+                .map(|conversations| conversations.len() as u64),
+        }
+    }
+
+    fn get_record_batches(&self, progress: &PipelineProgress) -> Result<Vec<RecordBatch>> {
+        let conversations = self.get_conversations()?;
+        progress.chat_planned(conversations.len() as u64);
+        Ok(conversations
+            .iter()
+            .filter_map(|conversation| {
+                self.get_record_lines(conversation)
+                    .map_err(|e| {
+                        warn!(
+                            "Failed to get sms conversation {}: {}",
+                            conversation.rowid, e
+                        )
                     })
-                    .flatten()
-                    .map(RecordType::from)
-                    .collect()
+                    .ok()
+                    .map(|records| {
+                        let records = records
+                            .into_iter()
+                            .map(RecordType::from)
+                            .collect::<Vec<_>>();
+                        progress
+                            .chat_parsed(records.len() as u64, record_blob_count(&records) as u64);
+                        RecordBatch {
+                            label: conversation.rowid.to_string(),
+                            records,
+                        }
+                    })
             })
-            .map_err(|e| warn!("Failed to get sms conversations: {}", e))
-            .ok()
+            .collect())
     }
 }
 
@@ -334,8 +350,12 @@ impl Matcher {
 }
 
 impl MsgMatcher for Matcher {
-    fn get_records(&self) -> Option<Vec<RecordType>> {
-        self.extractor.get_records()
+    fn import_plan(&self) -> ImportPlan {
+        self.extractor.import_plan()
+    }
+
+    fn get_record_batches(&self, progress: &PipelineProgress) -> Result<Vec<RecordBatch>> {
+        self.extractor.get_record_batches(progress)
     }
 }
 
@@ -403,7 +423,7 @@ async fn ios_sms_minimal_sample() -> SqliteResult<()> {
         "owner-id".into(),
         "backup-1".into(),
     )?;
-    let records = matcher.get_records().unwrap();
+    let records = matcher.collect_records().unwrap();
     assert_eq!(records.len(), 1);
     let record = records[0].get_record();
     assert_eq!(record.chat_type, "iOS iMessage");
@@ -418,7 +438,9 @@ async fn ios_sms_minimal_sample() -> SqliteResult<()> {
 
     let dir = tempfile::tempdir().unwrap();
     let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
-    export_matcher(&mut store, &matcher).await.unwrap();
+    export_matcher(&mut store, &test_progress(), &matcher)
+        .await
+        .unwrap();
     let stored = store.query(crate::store::Query::default()).await.unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].content, "hello sms");
@@ -454,7 +476,7 @@ async fn ios_sms_group_chat_keeps_all_senders_in_one_group() -> SqliteResult<()>
         "owner-id".into(),
         "backup-1".into(),
     )?;
-    let records = matcher.get_records().unwrap();
+    let records = matcher.collect_records().unwrap();
     assert_eq!(records.len(), 2);
     assert!(records
         .iter()
@@ -500,8 +522,12 @@ async fn ios_sms_same_source_group_sender_timestamp_isolated_by_owner() -> Sqlit
         "owner-b".into(),
         "backup-b".into(),
     )?;
-    export_matcher(&mut store, &first).await.unwrap();
-    export_matcher(&mut store, &second).await.unwrap();
+    export_matcher(&mut store, &test_progress(), &first)
+        .await
+        .unwrap();
+    export_matcher(&mut store, &test_progress(), &second)
+        .await
+        .unwrap();
 
     let stored = store.query(crate::store::Query::default()).await.unwrap();
     assert_eq!(stored.len(), 2);
@@ -556,7 +582,7 @@ async fn ios_sms_line_changes_only_update_metadata_with_explicit_owner() -> Sqli
         "owner-id".into(),
         "backup-1".into(),
     )?;
-    let records = matcher.get_records().unwrap();
+    let records = matcher.collect_records().unwrap();
     assert_eq!(records.len(), 2);
     assert!(records
         .iter()
@@ -612,8 +638,12 @@ async fn ios_sms_duplicate_message_guid_updates_existing_record() -> SqliteResul
         "owner-id".into(),
         "backup-1".into(),
     )?;
-    export_matcher(&mut store, &matcher).await.unwrap();
-    export_matcher(&mut store, &matcher).await.unwrap();
+    export_matcher(&mut store, &test_progress(), &matcher)
+        .await
+        .unwrap();
+    export_matcher(&mut store, &test_progress(), &matcher)
+        .await
+        .unwrap();
 
     let stored = store.query(crate::store::Query::default()).await.unwrap();
     assert_eq!(stored.len(), 1);
@@ -652,7 +682,9 @@ async fn ios_sms_distinct_message_guids_with_same_legacy_key_both_insert() -> Sq
         "owner-id".into(),
         "backup-1".into(),
     )?;
-    export_matcher(&mut store, &matcher).await.unwrap();
+    export_matcher(&mut store, &test_progress(), &matcher)
+        .await
+        .unwrap();
 
     let stored = store.query(crate::store::Query::default()).await.unwrap();
     assert_eq!(stored.len(), 2);
@@ -695,8 +727,12 @@ async fn ios_sms_missing_message_guid_reimport_uses_rowid_source_message_id() ->
         "owner-id".into(),
         "backup-1".into(),
     )?;
-    export_matcher(&mut store, &matcher).await.unwrap();
-    export_matcher(&mut store, &matcher).await.unwrap();
+    export_matcher(&mut store, &test_progress(), &matcher)
+        .await
+        .unwrap();
+    export_matcher(&mut store, &test_progress(), &matcher)
+        .await
+        .unwrap();
 
     let stored = store.query(crate::store::Query::default()).await.unwrap();
     assert_eq!(stored.len(), 1);
@@ -739,7 +775,9 @@ async fn ios_sms_missing_message_guid_same_legacy_key_both_insert() -> SqliteRes
         "owner-id".into(),
         "backup-1".into(),
     )?;
-    export_matcher(&mut store, &matcher).await.unwrap();
+    export_matcher(&mut store, &test_progress(), &matcher)
+        .await
+        .unwrap();
 
     let stored = store.query(crate::store::Query::default()).await.unwrap();
     assert_eq!(stored.len(), 2);

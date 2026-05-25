@@ -41,8 +41,12 @@ impl Matcher {
 }
 
 impl MsgMatcher for Matcher {
-    fn get_records(&self) -> Option<Vec<RecordType>> {
-        self.qq_html_matcher.get_records()
+    fn import_plan(&self) -> ImportPlan {
+        self.qq_html_matcher.import_plan()
+    }
+
+    fn get_record_batches(&self, progress: &PipelineProgress) -> Result<Vec<RecordBatch>> {
+        self.qq_html_matcher.get_record_batches(progress)
     }
 }
 
@@ -95,7 +99,7 @@ mod tests {
             html
         );
         let matcher = Matcher::from_mht(mht.as_bytes(), "owner".into(), "Bob(456)".into()).unwrap();
-        let records = matcher.get_records().unwrap();
+        let records = matcher.collect_records().unwrap();
         assert_eq!(records.len(), 1);
         let record = records[0].get_record();
         assert_eq!(record.content, "hello<img>");
@@ -110,9 +114,13 @@ mod tests {
         let file = dir.path().join("Bob(456).mht");
         std::fs::write(&file, mht).unwrap();
         let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
-        exporter(&mut store, ExportType::WindowsQQ(&file, "owner".into()))
-            .await
-            .unwrap();
+        exporter(
+            &mut store,
+            &test_progress(),
+            ExportType::WindowsQQ(&file, "owner".into()),
+        )
+        .await
+        .unwrap();
         let stored = store.query(crate::store::Query::default()).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].content, "hello<img>");
