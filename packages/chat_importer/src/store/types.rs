@@ -16,6 +16,10 @@ pub struct Record {
     pub content: String,
     pub timestamp: i64,
     pub metadata: Option<Vec<u8>>,
+    pub source_kind: Option<String>,
+    pub source_group_id: Option<String>,
+    pub source_message_id: Option<String>,
+    pub source_backup_id: Option<String>,
 }
 
 impl Record {
@@ -37,6 +41,13 @@ pub enum RecordType {
 }
 
 impl RecordType {
+    pub fn attachment_count(&self) -> usize {
+        match self {
+            Self::Record(_) => 0,
+            Self::RecordWithAttachments { attachments, .. } => attachments.len(),
+        }
+    }
+
     pub fn into_parts(self) -> (Record, Attachments) {
         match self {
             Self::Record(record) => (record, Attachments::new()),
@@ -74,10 +85,13 @@ impl From<(Record, Attachments)> for RecordType {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+// Planned query DTO for browse/search UI and CLI repair commands.
+#[allow(dead_code)]
 pub struct Query {
     pub chat_type: Option<String>,
     pub owner_id: Option<String>,
     pub group_id: Option<String>,
+    pub conversation_key: Option<String>,
     pub sender_id: Option<String>,
     pub sender_name: Option<String>,
     pub keyword: Option<String>,
@@ -85,8 +99,11 @@ pub struct Query {
     pub after: Option<i64>,
     pub offset: Option<u64>,
     pub limit: Option<u32>,
+    pub include_duplicates: bool,
 }
 
+// Helper defaults used by the planned query API.
+#[allow(dead_code)]
 impl Query {
     pub fn offset(&self) -> u64 {
         self.offset.unwrap_or(0)
@@ -95,6 +112,58 @@ impl Query {
     pub fn limit(&self) -> u32 {
         self.limit.unwrap_or(100)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+// Request DTO for manually merging source conversations after multi-device imports.
+#[allow(dead_code)]
+pub struct ConversationMergeRequest {
+    pub chat_type: String,
+    pub owner_id: String,
+    pub source_group_ids: Vec<String>,
+    pub target_conversation_key: String,
+    pub display_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+// Preview DTO for merge tools to show duplicates/conflicts before applying changes.
+#[allow(dead_code)]
+pub struct ConversationMergePreview {
+    pub source_group_ids: Vec<String>,
+    pub duplicate_candidates: Vec<RecordDuplicateCandidate>,
+    pub conflicts: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+// Candidate DTO for future duplicate-review UI/CLI flows.
+#[allow(dead_code)]
+pub struct RecordDuplicateCandidate {
+    pub canonical_record_id: i64,
+    pub duplicate_record_id: i64,
+    pub reason: String,
+    pub confidence: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AssetWriteOutcome {
+    pub asset_hash: Vec<u8>,
+    pub canonical_asset_hash: Vec<u8>,
+    pub original_bytes: u64,
+    pub estimated_stored_bytes: u64,
+    pub new_stored_bytes: u64,
+    pub new_objects: usize,
+    pub exact_asset_new: bool,
+    pub canonical_asset_new: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteOutcome {
+    pub record_id: i64,
+    pub record_inserted: bool,
+    pub record_updated: bool,
+    pub attachments_seen: usize,
+    pub attachment_original_bytes: u64,
+    pub assets: Vec<AssetWriteOutcome>,
 }
 
 #[async_trait]

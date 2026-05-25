@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Error, ErrorKind, Write};
 use std::iter::IntoIterator;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::str::{from_utf8, Utf8Error};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
@@ -36,6 +35,8 @@ struct Contact {
     pub name: String,
     remark: Vec<u8>,
     head: Vec<u8>,
+    // contact type is useful for future official/openim/group filtering.
+    #[allow(dead_code)]
     pub user_type: i32,
 }
 
@@ -53,6 +54,7 @@ impl Contact {
             .into())
     }
 
+    // Kept for future avatar export or contact enrichment from WeChat head image metadata.
     #[allow(dead_code)]
     pub fn get_image(&self) -> Result<Option<String>, Utf8Error> {
         lazy_static! {
@@ -67,7 +69,7 @@ impl Contact {
 }
 
 enum MMType {
-    Vec(Vec<u8>),
+    Vec(()),
     String(String),
     SubString(String),
 }
@@ -136,7 +138,7 @@ impl MMMap {
                 }
             }
 
-            (size.into(), splitted_size.len())
+            (size, splitted_size.len())
         }
     }
 }
@@ -152,18 +154,16 @@ impl Iterator for MMMap {
                 self.pos += size;
 
                 let (sub_size, sub_pos_len) = Self::parse_pos(slice, 0);
-                (sub_size > 0 && sub_pos_len + sub_size <= slice.len())
-                    .then(|| {
-                        from_utf8(&slice[sub_pos_len..sub_pos_len + sub_size])
-                            .map(|s| MMType::SubString(s.into()))
-                            .or_else(|_| from_utf8(slice).map(|s| MMType::String(s.into())))
-                            .unwrap_or_else(|_| MMType::Vec(slice.into()))
-                    })
-                    .unwrap_or_else(|| {
-                        from_utf8(slice)
-                            .map(|s| MMType::String(s.into()))
-                            .unwrap_or_else(|_| MMType::Vec(slice.into()))
-                    })
+                if sub_size > 0 && sub_pos_len + sub_size <= slice.len() {
+                    from_utf8(&slice[sub_pos_len..sub_pos_len + sub_size])
+                        .map(|s| MMType::SubString(s.into()))
+                        .or_else(|_| from_utf8(slice).map(|s| MMType::String(s.into())))
+                        .unwrap_or(MMType::Vec(()))
+                } else {
+                    from_utf8(slice)
+                        .map(|s| MMType::String(s.into()))
+                        .unwrap_or(MMType::Vec(()))
+                }
             })
         } else {
             None
@@ -173,6 +173,7 @@ impl Iterator for MMMap {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TryFromPrimitive)]
 #[repr(u32)]
+#[derive(Default)]
 enum MsgType {
     Normal = 1,              // 文字/emoji
     Image = 3,               // 图片
@@ -188,13 +189,8 @@ enum MsgType {
     WeWorkContactShare = 66, // 企业微信联系人分享
     System = 10000,          // 系统信息，入群/群改名/他人撤回信息/红包领取提醒等等
     Revoke = 10002,          // 撤回信息修改
+    #[default]
     Unknown = u32::MAX,
-}
-
-impl Default for MsgType {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -257,27 +253,27 @@ impl AttachMetadata {
             }
         }
         let target = target_hashes;
-        (target.len() > 0)
-            .then(|| {
-                attaches
-                    .get(thum)
-                    .and_then(|blob| {
-                        blob_dhash(blob)
-                            .map_err(|e| warn!("Failed to decode image: {}, {}", thum, e))
-                            .ok()
-                    })
-                    .and_then(|thum_hash| {
-                        target
-                            .into_iter()
-                            .find(|hash| hamming_distance(*hash, thum_hash) <= 5)
-                            .or_else(|| {
-                                warn!("Failed to find similar image: {}", thum);
-                                None
-                            })
-                    })
-                    .is_none()
-            })
-            .unwrap_or(true)
+        if !target.is_empty() {
+            attaches
+                .get(thum)
+                .and_then(|blob| {
+                    blob_dhash(blob)
+                        .map_err(|e| warn!("Failed to decode image: {}, {}", thum, e))
+                        .ok()
+                })
+                .and_then(|thum_hash| {
+                    target
+                        .into_iter()
+                        .find(|hash| hamming_distance(*hash, thum_hash) <= 5)
+                        .or_else(|| {
+                            warn!("Failed to find similar image: {}", thum);
+                            None
+                        })
+                })
+                .is_none()
+        } else {
+            true
+        }
     }
 
     async fn hash_checker(
@@ -332,7 +328,7 @@ impl AttachMetadata {
         self.hash.insert(
             name,
             tag.parse()
-                .map(|f| MetadataType::Float(f))
+                .map(MetadataType::Float)
                 .unwrap_or(MetadataType::Str(tag)),
         );
         self
@@ -355,11 +351,23 @@ struct RecordLine {
     server_id: i64,
     created_time: i64,
     message: String,
+    // message status can be useful for future sent/failed/deleted state filtering.
+    #[allow(dead_code)]
     status: u8,
+    // Image status can help future attachment recovery distinguish pending thumbnails.
+    #[allow(dead_code)]
     image_status: u16,
     msg_type: MsgType,
     is_dest: bool,
     skip_resource: bool,
+}
+
+struct AttachmentFile<'a> {
+    account: &'a str,
+    hashed_user: &'a str,
+    file_type: &'a str,
+    folder: &'a str,
+    ext: &'a str,
 }
 
 impl RecordLine {
@@ -396,8 +404,8 @@ impl RecordLine {
             static ref BUFFER_ID_MATCH: Regex = Regex::new(r#"bufid\s*?=\s*?"(.*?)""#).unwrap();
         }
         [
-            self.get_match_string(&*BUFFER_ID_MATCH, "bufid"),
-            self.get_match_string(&*CLIENT_ID_MATCH, "clientid"),
+            self.get_match_string(&BUFFER_ID_MATCH, "bufid"),
+            self.get_match_string(&CLIENT_ID_MATCH, "clientid"),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
@@ -417,10 +425,10 @@ impl RecordLine {
             static ref AES_KEY_MATCH: Regex = Regex::new(r#"aeskey\s*?=\s*?"(.*?)""#).unwrap();
         }
         [
-            self.get_match_string(&*CDN_THUM_URL_MATCH, "thum_cdn"),
-            self.get_match_string(&*CDN_SMALL_URL_MATCH, "img_cdn"),
-            self.get_match_string(&*CDN_HD_URL_MATCH, "hd_cdn"),
-            self.get_match_string(&*AES_KEY_MATCH, "key"),
+            self.get_match_string(&CDN_THUM_URL_MATCH, "thum_cdn"),
+            self.get_match_string(&CDN_SMALL_URL_MATCH, "img_cdn"),
+            self.get_match_string(&CDN_HD_URL_MATCH, "hd_cdn"),
+            self.get_match_string(&AES_KEY_MATCH, "key"),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
@@ -435,8 +443,8 @@ impl RecordLine {
             static ref AES_KEY_MATCH: Regex = Regex::new(r#"aeskey\s*?=\s*?"(.*?)""#).unwrap();
         }
         [
-            self.get_match_string(&*CDN_URL_MATCH, "cdn"),
-            self.get_match_string(&*AES_KEY_MATCH, "key"),
+            self.get_match_string(&CDN_URL_MATCH, "cdn"),
+            self.get_match_string(&AES_KEY_MATCH, "key"),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
@@ -454,7 +462,17 @@ impl RecordLine {
     ) -> Option<(AttachMetadata, Attachments)> {
         let (ftype, dir, ext) = ("voice", "Audio", "aud");
         Self::get_files(vec![self
-            .get_file(backup, backups, account, hashed_user, ftype, dir, ext)
+            .get_file(
+                backup,
+                backups,
+                AttachmentFile {
+                    account,
+                    hashed_user,
+                    file_type: ftype,
+                    folder: dir,
+                    ext,
+                },
+            )
             .map(|(metadata, data)| (ftype.into(), metadata, data))])
     }
 
@@ -472,13 +490,13 @@ impl RecordLine {
                 Regex::new(r#"smallheadimgurl\s*?=\s*?"(.*?)""#).unwrap();
         }
         [
-            self.get_match_string(&*NICKNAME_MATCH, "nickname"),
-            self.get_match_string(&*USERNAME_MATCH, "username"),
-            self.get_match_string(&*CITY_MATCH, "city"),
-            self.get_match_string(&*PROVINCE_MATCH, "province"),
-            self.get_match_string(&*OPENIMDESC_MATCH, "openimdesc"),
-            self.get_match_string(&*BIG_IMG_MATCH, "head")
-                .or_else(|| self.get_match_string(&*SMALL_IMG_MATCH, "head")),
+            self.get_match_string(&NICKNAME_MATCH, "nickname"),
+            self.get_match_string(&USERNAME_MATCH, "username"),
+            self.get_match_string(&CITY_MATCH, "city"),
+            self.get_match_string(&PROVINCE_MATCH, "province"),
+            self.get_match_string(&OPENIMDESC_MATCH, "openimdesc"),
+            self.get_match_string(&BIG_IMG_MATCH, "head")
+                .or_else(|| self.get_match_string(&SMALL_IMG_MATCH, "head")),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
@@ -542,16 +560,16 @@ impl RecordLine {
                 .collect::<HashMap<_, _>>()
         };
         let metadata = [
-            self.get_match_string(&*TITLE_CDATA_MATCH, "title")
-                .or_else(|| self.get_match_string(&*TITLE_MATCH, "title")),
-            self.get_match_string(&*DESCRIPTION_CDATA_MATCH, "description")
-                .or_else(|| self.get_match_string(&*DESCRIPTION_MATCH, "description")),
-            self.get_match_string(&*THUM_MATCH, "thum"),
-            self.get_match_string(&*RECORD_INFO_MATCH, "record")
-                .or_else(|| self.get_match_string(&*RECORD_INFO_ESCAPE_MATCH, "record")),
-            self.get_match_string(&*APPNAME_MATCH, "app"),
-            self.get_match_string(&*URL_CDATA_MATCH, "url")
-                .or_else(|| self.get_match_string(&*URL_MATCH, "url")),
+            self.get_match_string(&TITLE_CDATA_MATCH, "title")
+                .or_else(|| self.get_match_string(&TITLE_MATCH, "title")),
+            self.get_match_string(&DESCRIPTION_CDATA_MATCH, "description")
+                .or_else(|| self.get_match_string(&DESCRIPTION_MATCH, "description")),
+            self.get_match_string(&THUM_MATCH, "thum"),
+            self.get_match_string(&RECORD_INFO_MATCH, "record")
+                .or_else(|| self.get_match_string(&RECORD_INFO_ESCAPE_MATCH, "record")),
+            self.get_match_string(&APPNAME_MATCH, "app"),
+            self.get_match_string(&URL_CDATA_MATCH, "url")
+                .or_else(|| self.get_match_string(&URL_MATCH, "url")),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
@@ -575,11 +593,11 @@ impl RecordLine {
             static ref EXTERN_MATCH: Regex = Regex::new(r#"externurl\s*?=\s*?"(.*?)""#).unwrap();
         }
         [
-            self.get_match_string(&*MD5_MATCH, "md5"),
-            self.get_match_string(&*CDN_URL_MATCH, "cdn"),
-            self.get_match_string(&*AES_KEY_MATCH, "key"),
-            self.get_match_string(&*ENC_URL_MATCH, "enc"),
-            self.get_match_string(&*EXTERN_MATCH, "extern"),
+            self.get_match_string(&MD5_MATCH, "md5"),
+            self.get_match_string(&CDN_URL_MATCH, "cdn"),
+            self.get_match_string(&AES_KEY_MATCH, "key"),
+            self.get_match_string(&ENC_URL_MATCH, "enc"),
+            self.get_match_string(&EXTERN_MATCH, "extern"),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
@@ -611,15 +629,15 @@ impl RecordLine {
         }
 
         [
-            self.get_match_string(&*LABEL_MATCH, "label"),
-            self.get_match_string(&*NAME_MATCH, "name"),
+            self.get_match_string(&LABEL_MATCH, "label"),
+            self.get_match_string(&NAME_MATCH, "name"),
         ]
         .iter()
         .filter_map(|e| e.as_ref())
         .fold(
             [
-                self.get_match_string(&*X_MATCH, "x"),
-                self.get_match_string(&*Y_MATCH, "y"),
+                self.get_match_string(&X_MATCH, "x"),
+                self.get_match_string(&Y_MATCH, "y"),
             ]
             .iter()
             .filter_map(|e| e.as_ref())
@@ -634,7 +652,7 @@ impl RecordLine {
         lazy_static! {
             static ref CONTENT_MATCH: Regex = Regex::new(r#"msgContent\s*?=\s*?"(.*?)""#).unwrap();
         }
-        [self.get_match_string(&*CONTENT_MATCH, "content")]
+        [self.get_match_string(&CONTENT_MATCH, "content")]
             .iter()
             .filter_map(|e| e.as_ref())
             .fold(AttachMetadata::new(), |metadata, (k, v)| {
@@ -650,8 +668,8 @@ impl RecordLine {
                 Regex::new(r"<revokecontent><!\[CDATA\[((?s).*?)]]></revokecontent>").unwrap();
         }
         [self
-            .get_match_string(&*REVOKE_CDATA_MATCH, "revoke")
-            .or_else(|| self.get_match_string(&*REVOKE_MATCH, "revoke"))]
+            .get_match_string(&REVOKE_CDATA_MATCH, "revoke")
+            .or_else(|| self.get_match_string(&REVOKE_MATCH, "revoke"))]
         .iter()
         .filter_map(|e| e.as_ref())
         .fold(AttachMetadata::new(), |metadata, (k, v)| {
@@ -668,7 +686,17 @@ impl RecordLine {
     ) -> Option<(AttachMetadata, Attachments)> {
         let (ftype, dir, ext) = ("video", "Video", "mp4");
         Self::get_files(vec![self
-            .get_file(backup, backups, account, hashed_user, ftype, dir, ext)
+            .get_file(
+                backup,
+                backups,
+                AttachmentFile {
+                    account,
+                    hashed_user,
+                    file_type: ftype,
+                    folder: dir,
+                    ext,
+                },
+            )
             .map(|(metadata, data)| (ftype.into(), metadata, data))])
     }
 
@@ -680,8 +708,18 @@ impl RecordLine {
         hashed_user: &str,
     ) -> Option<(String, AttachMetadata, Vec<u8>)> {
         let (ftype, dir, ext) = ("img", "Img", "pic");
-        self.get_file(backup, backups, account, hashed_user, ftype, dir, ext)
-            .map(|(metadata, data)| (ftype.into(), metadata, data))
+        self.get_file(
+            backup,
+            backups,
+            AttachmentFile {
+                account,
+                hashed_user,
+                file_type: ftype,
+                folder: dir,
+                ext,
+            },
+        )
+        .map(|(metadata, data)| (ftype.into(), metadata, data))
     }
 
     fn get_image_hd(
@@ -692,8 +730,18 @@ impl RecordLine {
         hashed_user: &str,
     ) -> Option<(String, AttachMetadata, Vec<u8>)> {
         let (ftype, dir, ext) = ("hd", "Img", "pic_hd");
-        self.get_file(backup, backups, account, hashed_user, ftype, dir, ext)
-            .map(|(metadata, data)| (ftype.into(), metadata, data))
+        self.get_file(
+            backup,
+            backups,
+            AttachmentFile {
+                account,
+                hashed_user,
+                file_type: ftype,
+                folder: dir,
+                ext,
+            },
+        )
+        .map(|(metadata, data)| (ftype.into(), metadata, data))
     }
 
     fn get_image_thum(
@@ -704,8 +752,18 @@ impl RecordLine {
         hashed_user: &str,
     ) -> Option<(String, AttachMetadata, Vec<u8>)> {
         let (ftype, dir, ext) = ("thum", "Img", "pic_thum");
-        self.get_file(backup, backups, account, hashed_user, ftype, dir, ext)
-            .map(|(metadata, data)| (ftype.into(), metadata, data))
+        self.get_file(
+            backup,
+            backups,
+            AttachmentFile {
+                account,
+                hashed_user,
+                file_type: ftype,
+                folder: dir,
+                ext,
+            },
+        )
+        .map(|(metadata, data)| (ftype.into(), metadata, data))
     }
 
     fn get_files<I>(iter: I) -> Option<(AttachMetadata, Attachments)>
@@ -736,11 +794,7 @@ impl RecordLine {
         &self,
         backup: &Backup,
         backups: &HashMap<String, BackupFile>,
-        account: &str,
-        hashed_user: &str,
-        file_type: &str,
-        folder: &str,
-        ext: &str,
+        file: AttachmentFile<'_>,
     ) -> Option<(AttachMetadata, Vec<u8>)> {
         if self.skip_resource {
             None
@@ -748,22 +802,22 @@ impl RecordLine {
             backups
                 .get(&format!(
                     "Documents/{}/{}/{}/{}.{}",
-                    account, folder, hashed_user, self.local_id, ext
+                    file.account, file.folder, file.hashed_user, self.local_id, file.ext
                 ))
                 .or_else(|| {
                     debug!(
                         "{} not found: {}, {}, {}",
-                        file_type, account, hashed_user, self.local_id
+                        file.file_type, file.account, file.hashed_user, self.local_id
                     );
                     None
                 })
-                .and_then(|file| {
+                .and_then(|backup_file| {
                     backup
-                        .read_file(file)
+                        .read_file(backup_file)
                         .map_err(|e| {
                             warn!(
                                 "failed to read {}: {}, {}, {}, {}",
-                                file_type, account, hashed_user, self.local_id, e
+                                file.file_type, file.account, file.hashed_user, self.local_id, e
                             )
                         })
                         .ok()
@@ -771,7 +825,7 @@ impl RecordLine {
                 .map(|data| {
                     (
                         AttachMetadata::new()
-                            .with_hash(file_type.into(), Hash32::sha3_256(&data).to_hex()),
+                            .with_hash(file.file_type.into(), Hash32::sha3_256(&data).to_hex()),
                         data,
                     )
                 })
@@ -840,7 +894,7 @@ impl UserDB {
                 );
                 let data = backup
                     .read_file(file)
-                    .map_err(|e| Error::new(ErrorKind::Other, format!("{}", e)))?;
+                    .map_err(|e| Error::other(format!("{}", e)))?;
                 tmpfile.write_all(&data)?;
                 Ok(tmpfile)
             }) {
@@ -886,8 +940,26 @@ impl UserDB {
 
     pub fn build(&mut self, backup: &Backup) -> Result<(), Box<dyn std::error::Error>> {
         self.load_settings(backup)?;
+        self.validate_owner_identity()?;
         self.load_contacts()?;
         self.load_chats()?;
+        Ok(())
+    }
+
+    fn validate_owner_identity(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.wxid.trim().is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("missing wxid for WeChat account {}", self.account),
+            )
+            .into());
+        }
+        if self.name.trim().is_empty() {
+            warn!("missing display name for WeChat account {}", self.account);
+        }
+        if self.head.trim().is_empty() {
+            warn!("missing avatar URL for WeChat account {}", self.account);
+        }
         Ok(())
     }
 
@@ -907,7 +979,7 @@ impl UserDB {
                         .as_dictionary()
                         .and_then(|dict| dict.get("$objects"))
                         .and_then(|obj| obj.as_array())
-                        .map(|a| a.clone())
+                        .cloned()
                 })
             {
                 if array.len() > 3 {
@@ -921,21 +993,16 @@ impl UserDB {
                         .unwrap_or_default();
                 }
                 if array.len() > 50 {
-                    self.head = if let Some(head) = array
+                    self.head = array
                         .iter()
                         .filter_map(|v| v.as_string())
-                        .filter(|s| {
+                        .find(|s| {
                             s.starts_with("http://")
                                 && s.find("mmhead").is_some()
                                 && s.find("/132").is_some()
                         })
-                        .next()
-                    {
-                        head
-                    } else {
-                        ""
-                    }
-                    .to_string();
+                        .unwrap_or_default()
+                        .to_string();
                 }
             } else {
                 warn!(
@@ -997,7 +1064,7 @@ impl UserDB {
                         .query_map(params![], |row| {
                             let name: String = row.get(0)?;
                             let hash = &name[5..];
-                            if !contact_keys.iter().any(|&i| i == hash) && hash != self.account {
+                            if !contact_keys.contains(&hash) && hash != self.account {
                                 warn!("Contact info for chat not exists: {}", hash);
                             }
                             Ok((hash.into(), name))
@@ -1048,7 +1115,7 @@ impl UserDB {
         let mut summaries = self
             .contacts
             .iter()
-            .filter(|(hash, _)| chat_keys.iter().any(|&i| i == hash.as_str()))
+            .filter(|(hash, _)| chat_keys.contains(&hash.as_str()))
             .map(|(hash, contact)| {
                 format!(
                     "{} | {} | {}",
@@ -1206,7 +1273,7 @@ impl UserDB {
             .map(|c| {
                 self.contacts
                     .get(&gen_md5(&c[1]))
-                    .map(|c| c.clone())
+                    .cloned()
                     .unwrap_or_else(|| Contact::from_name(c[1].into()))
             })
             .map(|c| (c.name.clone(), c.get_remark().unwrap_or_default()))
@@ -1223,7 +1290,7 @@ impl UserDB {
             .map(|c| {
                 self.contacts
                     .get(&gen_md5(&c[1]))
-                    .map(|c| c.clone())
+                    .cloned()
                     .unwrap_or_else(|| Contact::from_name(c[1].into()))
             })
             .map(|c| {
@@ -1244,7 +1311,15 @@ impl UserDB {
         use std::hash::Hasher;
         let mut hasher = Hasher128::with_seed(42);
         hasher.write(&server_id.to_be_bytes());
-        (((hasher.finish() as u128) * 1000) / u32::MAX as u128) as i64
+        (((hasher.finish() as u128) * 1000) / u64::MAX as u128) as i64
+    }
+
+    fn create_time_timestamp_millis(created_time: i64, server_id: i64) -> i64 {
+        if created_time.abs() >= 100_000_000_000 {
+            created_time
+        } else {
+            created_time * 1000 + Self::get_microsecond(server_id)
+        }
     }
 
     fn transform_record_line(
@@ -1436,7 +1511,7 @@ impl UserDB {
             for (hash, path) in
                 line.get_attach_hashs(backup, &self.account, &gen_md5(&contact.name))
             {
-                if loaded_hashs.get(&hash).is_none() && !path.ends_with(".video_thum") {
+                if !loaded_hashs.contains(&hash) && !path.ends_with(".video_thum") {
                     warn!(
                         "Hash {} not exists: {}, {} | {} | {:?}",
                         hash, path, line.local_id, line.created_time, line.msg_type
@@ -1445,6 +1520,7 @@ impl UserDB {
             }
         }
 
+        let source_message_id = Self::source_message_id(contact, line, &content, &attach);
         let record = Record {
             chat_type: "WeChat".into(),
             owner_id: self.wxid.clone(),
@@ -1452,12 +1528,15 @@ impl UserDB {
             sender_id,
             sender_name,
             content,
-            timestamp: line.created_time * 1000 + Self::get_microsecond(line.server_id),
+            timestamp: Self::create_time_timestamp_millis(line.created_time, line.server_id),
             metadata: metadata.as_ref().and_then(|m| {
                 to_vec(m)
                     .map_err(|e| warn!("failed to serialization metadata: {}", e))
                     .ok()
             }),
+            source_kind: Some("ios-wechat".into()),
+            source_group_id: Some(contact.name.clone()),
+            source_message_id: Some(source_message_id),
             ..Default::default()
         };
 
@@ -1466,6 +1545,28 @@ impl UserDB {
         } else {
             RecordType::from(record)
         })
+    }
+
+    fn source_message_id(
+        contact: &Contact,
+        line: &RecordLine,
+        content: &str,
+        attach: &Attachments,
+    ) -> String {
+        if line.server_id > 0 {
+            // MesSvrID is assigned by server and survives device migration better than
+            // local ids, so it is the stable key for de-duping repeated imports of one account.
+            format!("svr:{}:{}", contact.name, line.server_id)
+        } else {
+            // Local ids are only a fallback for records without a server id; include content and
+            // attachments so unrelated messages from another device are less likely to collide.
+            let content_hash = Hash32::sha3_256(content.as_bytes()).to_hex();
+            let attachment_hash = attachment_fingerprint(attach);
+            format!(
+                "fallback:{}:{}:{}:{}:{}",
+                contact.name, line.created_time, line.local_id, content_hash, attachment_hash
+            )
+        }
     }
 
     fn transform_record_lines(
@@ -1555,44 +1656,7 @@ struct Extractor {
 }
 
 impl Extractor {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut backup = Backup::new(path)?;
-        if backup.manifest.is_encrypted {
-            backup.parse_keybag().map_err(|e| {
-                error!("failed to parse encrypted backup keybag: {}", e);
-                e
-            })?;
-            debug!("trying decrypt of backup keybag");
-            if let Some(ref mut kb) = backup.manifest.keybag.as_mut() {
-                let pass = rpassword::prompt_password("Backup Password: ")?;
-                kb.unlock_with_passcode(&pass);
-            } else {
-                error!("encrypted backup has no keybag");
-                return Err(
-                    Error::new(ErrorKind::InvalidData, "encrypted backup has no keybag").into(),
-                );
-            }
-            catch_unwind(AssertUnwindSafe(|| backup.manifest.unlock_manifest())).map_err(|_| {
-                error!("failed to unlock encrypted backup manifest; check backup password");
-                Error::new(
-                    ErrorKind::PermissionDenied,
-                    "failed to unlock encrypted backup manifest",
-                )
-            })?;
-            backup.parse_manifest().map_err(|e| {
-                error!(
-                    "failed to decrypt or parse encrypted backup manifest; check backup password: {}",
-                    e
-                );
-                e
-            })?;
-            backup.unwrap_file_keys().map_err(|e| {
-                error!("failed to unwrap encrypted backup file keys: {}", e);
-                e
-            })?;
-        } else {
-            backup.parse_manifest()?;
-        }
+    pub fn from_backup(backup: Backup) -> Result<Self, Box<dyn std::error::Error>> {
         let user_info = Self::get_user_info(&backup);
         if user_info.is_empty() {
             warn!("no complete user database found in backup");
@@ -1609,7 +1673,7 @@ impl Extractor {
             "session.db",
         ];
         let mut user_map = HashMap::new();
-        let paths = vec![
+        let paths = [
             backup.find_wildcard_paths(DOMAIN, "*/WCDB_Contact.sqlite"),
             backup.find_wildcard_paths(DOMAIN, "*/MM.sqlite"),
             backup.find_wildcard_paths(DOMAIN, "*/message_*.sqlite"),
@@ -1647,12 +1711,12 @@ impl Extractor {
                     }
                     if let Some(user) = user_map.remove(&user_id) {
                         let user: UserDB = user;
-                        user_map.insert(user_id, user.with(&backup, file));
+                        user_map.insert(user_id, user.with(backup, file));
                     } else {
                         user_map.insert(
                             user_id.clone(),
                             UserDB::new(
-                                &backup,
+                                backup,
                                 user_id.clone(),
                                 file,
                                 backup.find_wildcard_paths(
@@ -1674,7 +1738,7 @@ impl Extractor {
             .filter(|(_, user_db)| user_db.is_complete())
             .filter_map(|(user_id, user_db)| {
                 let mut user = user_db.clone();
-                user.build(&backup)
+                user.build(backup)
                     .map(|_| (user_id.clone(), user))
                     .map_err(|e| warn!("failed to init user: {}", e))
                     .ok()
@@ -1700,8 +1764,8 @@ pub struct Matcher {
 }
 
 impl Matcher {
-    pub fn new<P: AsRef<Path>>(path: P, names: Option<Vec<String>>) -> Result<Box<dyn MsgMatcher>> {
-        let extractor = Extractor::new(path).map_err(|e| anyhow::anyhow!("{}", e))?;
+    pub fn from_backup(backup: Backup, names: Option<Vec<String>>) -> Result<Box<dyn MsgMatcher>> {
+        let extractor = Extractor::from_backup(backup).map_err(|e| anyhow::anyhow!("{}", e))?;
         let extract_ids = extractor.get_users();
         Ok(Box::new(Self {
             extractor,
@@ -1712,10 +1776,10 @@ impl Matcher {
     }
 }
 
-struct iOSWCMetadataMerger;
+struct IosWcMetadataMerger;
 
 #[async_trait::async_trait]
-impl MetadataMerger for iOSWCMetadataMerger {
+impl MetadataMerger for IosWcMetadataMerger {
     async fn merge(
         &self,
         store: &ChatStore,
@@ -1760,7 +1824,7 @@ impl MsgMatcher for Matcher {
     }
 
     fn get_metadata_merger(&self) -> Option<Box<dyn MetadataMerger>> {
-        Some(Box::new(iOSWCMetadataMerger))
+        Some(Box::new(IosWcMetadataMerger))
     }
 }
 
@@ -1803,6 +1867,288 @@ mod tests {
         assert!(summaries[0].contains("alice"));
     }
 
+    #[test]
+    fn user_db_rejects_missing_wxid() {
+        let user_db = UserDB {
+            account: "account-a".into(),
+            name: "Display Name".into(),
+            ..Default::default()
+        };
+
+        assert!(user_db.validate_owner_identity().is_err());
+    }
+
+    #[test]
+    fn user_db_allows_missing_name_and_head_when_wxid_exists() {
+        let user_db = UserDB {
+            account: "account-a".into(),
+            wxid: "wxid_a".into(),
+            ..Default::default()
+        };
+
+        assert!(user_db.validate_owner_identity().is_ok());
+    }
+
+    #[test]
+    fn extractor_skips_user_db_with_missing_wxid_without_records() {
+        let dir = tempdir().unwrap();
+        write_minimal_backup_metadata(dir.path());
+
+        let mut settings = plist::Dictionary::new();
+        settings.insert(
+            "$objects".into(),
+            Value::Array(vec![
+                Value::String("$null".into()),
+                Value::String("unused".into()),
+                Value::String("".into()),
+                Value::String("Display Name".into()),
+            ]),
+        );
+        let mut settings_data = Vec::new();
+        plist::to_writer_binary(&mut settings_data, &Value::Dictionary(settings)).unwrap();
+
+        let files = [
+            (
+                "aa00000000000000000000000000000000000001",
+                "Documents/account-a/WCDB_Contact.sqlite",
+                Vec::new(),
+            ),
+            (
+                "aa00000000000000000000000000000000000002",
+                "Documents/account-a/message_0.sqlite",
+                Vec::new(),
+            ),
+            (
+                "aa00000000000000000000000000000000000003",
+                "Documents/account-a/session/session.db",
+                Vec::new(),
+            ),
+            (
+                "aa00000000000000000000000000000000000004",
+                "Documents/account-a/mmsetting.archive",
+                settings_data,
+            ),
+        ];
+
+        let conn = Connection::open(dir.path().join("Manifest.db")).unwrap();
+        conn.execute(
+            "CREATE TABLE Files (
+                fileid TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                relativePath TEXT NOT NULL,
+                flags INTEGER NOT NULL,
+                file BLOB NOT NULL
+            );",
+            [],
+        )
+        .unwrap();
+        for (fileid, relative_path, bytes) in files {
+            let object_dir = dir.path().join(&fileid[..2]);
+            std::fs::create_dir_all(&object_dir).unwrap();
+            std::fs::write(object_dir.join(fileid), bytes).unwrap();
+            conn.execute(
+                "INSERT INTO Files VALUES (?1, ?2, ?3, 1, X'00')",
+                (fileid, DOMAIN, relative_path),
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut backup = Backup::new(dir.path()).unwrap();
+        backup.parse_manifest().unwrap();
+        let matcher = Matcher::from_backup(backup, None).unwrap();
+        let records = matcher.get_records().unwrap();
+        assert!(records.is_empty());
+    }
+
+    fn write_minimal_backup_metadata(dir: &Path) {
+        let mut status = plist::Dictionary::new();
+        status.insert("BackupState".into(), "new".into());
+        status.insert("Date".into(), "2026-05-25".into());
+        status.insert("IsFullBackup".into(), true.into());
+        status.insert("SnapshotState".into(), "finished".into());
+        status.insert("UUID".into(), "backup-uuid".into());
+        status.insert("Version".into(), "2.4".into());
+        plist::to_file_xml(dir.join("Status.plist"), &Value::Dictionary(status)).unwrap();
+
+        let mut info = plist::Dictionary::new();
+        info.insert("Product Type".into(), "iPhone".into());
+        info.insert("Product Version".into(), "18.0".into());
+        info.insert("Target Identifier".into(), "device-id".into());
+        info.insert("Target Type".into(), "Device".into());
+        plist::to_file_xml(dir.join("Info.plist"), &Value::Dictionary(info)).unwrap();
+
+        let mut lockdown = plist::Dictionary::new();
+        lockdown.insert("ProductVersion".into(), "18.0".into());
+        lockdown.insert("ProductType".into(), "iPhone".into());
+        lockdown.insert("UniqueDeviceID".into(), "device-id".into());
+        lockdown.insert("SerialNumber".into(), "serial".into());
+        lockdown.insert("DeviceName".into(), "Test Phone".into());
+        let mut manifest = plist::Dictionary::new();
+        manifest.insert("IsEncrypted".into(), false.into());
+        manifest.insert("Version".into(), "9.1".into());
+        manifest.insert("Date".into(), "2026-05-25".into());
+        manifest.insert("SystemDomainsVersion".into(), "20".into());
+        manifest.insert("WasPasscodeSet".into(), false.into());
+        manifest.insert("Lockdown".into(), Value::Dictionary(lockdown));
+        plist::to_file_xml(dir.join("Manifest.plist"), &Value::Dictionary(manifest)).unwrap();
+    }
+
+    #[test]
+    fn ios_wechat_second_create_time_is_converted_to_millis() {
+        let timestamp = UserDB::create_time_timestamp_millis(1_598_219_157, 42);
+
+        assert!((1_598_219_157_000..1_598_219_158_000).contains(&timestamp));
+    }
+
+    #[test]
+    fn ios_wechat_millisecond_create_time_is_not_multiplied_again() {
+        assert_eq!(
+            UserDB::create_time_timestamp_millis(1_598_219_157_438, 42),
+            1_598_219_157_438
+        );
+    }
+
+    #[tokio::test]
+    async fn ios_wechat_same_sender_second_collision_uses_source_message_id() {
+        let backup_dir = tempdir().unwrap();
+        write_minimal_backup_metadata(backup_dir.path());
+        let backup = Backup::new(backup_dir.path()).unwrap();
+        let user_db = UserDB {
+            account: "account-a".into(),
+            wxid: "owner".into(),
+            name: "Owner".into(),
+            ..Default::default()
+        };
+        let contact = Contact::from_name("chat-a".into());
+        let first_server_id = 173_689_208_819_417_360;
+        let second_server_id = 2_105_540_167_727_085_274;
+        assert_eq!(
+            UserDB::create_time_timestamp_millis(1_513_479_186, first_server_id),
+            UserDB::create_time_timestamp_millis(1_513_479_186, second_server_id)
+        );
+
+        let first = user_db
+            .transform_record_line(
+                &backup,
+                &RecordLine {
+                    local_id: 988,
+                    server_id: first_server_id,
+                    created_time: 1_513_479_186,
+                    message: "first".into(),
+                    status: 0,
+                    image_status: 0,
+                    msg_type: MsgType::Normal,
+                    is_dest: false,
+                    skip_resource: false,
+                },
+                &contact,
+            )
+            .unwrap();
+        let second = user_db
+            .transform_record_line(
+                &backup,
+                &RecordLine {
+                    local_id: 991,
+                    server_id: second_server_id,
+                    created_time: 1_513_479_186,
+                    message: "second".into(),
+                    status: 0,
+                    image_status: 0,
+                    msg_type: MsgType::Normal,
+                    is_dest: false,
+                    skip_resource: false,
+                },
+                &contact,
+            )
+            .unwrap();
+
+        assert_ne!(
+            first.get_record().source_message_id,
+            second.get_record().source_message_id
+        );
+        let dir = tempdir().unwrap();
+        let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
+        export_matcher(
+            &mut store,
+            &TestMatcher {
+                records: vec![first, second],
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = store.query(crate::store::Query::default()).await.unwrap();
+        assert_eq!(stored.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ios_wechat_same_server_id_across_local_ids_dedupes() {
+        let backup_dir = tempdir().unwrap();
+        write_minimal_backup_metadata(backup_dir.path());
+        let backup = Backup::new(backup_dir.path()).unwrap();
+        let user_db = UserDB {
+            account: "account-a".into(),
+            wxid: "owner".into(),
+            name: "Owner".into(),
+            ..Default::default()
+        };
+        let contact = Contact::from_name("chat-a".into());
+        let first = user_db
+            .transform_record_line(
+                &backup,
+                &RecordLine {
+                    local_id: 1,
+                    server_id: 42,
+                    created_time: 1_513_479_186,
+                    message: "first".into(),
+                    status: 0,
+                    image_status: 0,
+                    msg_type: MsgType::Normal,
+                    is_dest: false,
+                    skip_resource: false,
+                },
+                &contact,
+            )
+            .unwrap();
+        let second = user_db
+            .transform_record_line(
+                &backup,
+                &RecordLine {
+                    local_id: 999,
+                    server_id: 42,
+                    created_time: 1_513_479_186,
+                    message: "updated".into(),
+                    status: 0,
+                    image_status: 0,
+                    msg_type: MsgType::Normal,
+                    is_dest: false,
+                    skip_resource: false,
+                },
+                &contact,
+            )
+            .unwrap();
+        assert_eq!(
+            first.get_record().source_message_id,
+            second.get_record().source_message_id
+        );
+
+        let dir = tempdir().unwrap();
+        let mut store = ChatStore::open(dir.path().join("record.db")).await.unwrap();
+        export_matcher(
+            &mut store,
+            &TestMatcher {
+                records: vec![first, second],
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = store.query(crate::store::Query::default()).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].content, "updated");
+    }
+
     #[tokio::test]
     async fn ios_wechat_image_thumbnail_metadata_merge_sample() {
         let dir = tempdir().unwrap();
@@ -1843,7 +2189,7 @@ mod tests {
             .await
             .unwrap();
 
-        let merger = iOSWCMetadataMerger;
+        let merger = IosWcMetadataMerger;
         let merged = merger
             .merge(
                 &store,
@@ -1877,7 +2223,7 @@ mod tests {
         }
 
         fn get_metadata_merger(&self) -> Option<Box<dyn MetadataMerger>> {
-            Some(Box::new(iOSWCMetadataMerger))
+            Some(Box::new(IosWcMetadataMerger))
         }
     }
 

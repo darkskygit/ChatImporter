@@ -38,8 +38,11 @@ pub struct BackupManifestLockdown {
 impl BackupManifest {
     /// Unwrap manifest key using protection class
     /// https://stackoverflow.com/questions/1498342/how-to-decrypt-an-encrypted-apple-itunes-iphone-backup/13793043
-    pub fn unlock_manifest(&mut self) {
+    pub fn unlock_manifest(&mut self) -> Result<(), BackupError> {
         if let Some(ref manifest_key) = self.manifest_key {
+            if manifest_key.len() < 4 {
+                return Err(BackupError::InvalidKeybag);
+            }
             debug!("unwrapping manifest key...");
             let protclass = as_u32_le(&manifest_key[0..4]);
             debug!("manifest protection class: {:x?}", protclass);
@@ -47,14 +50,17 @@ impl BackupManifest {
             let class_key = self
                 .keybag
                 .as_ref()
-                .expect("expect locked manifest to have keybag")
+                .ok_or(BackupError::NoKeybag)?
                 .find_class_key(&clazz)
-                .unwrap();
-            let items: Vec<u8> = manifest_key[4..].iter().cloned().collect();
-            let result_key = unwrap_key(&class_key, &items);
+                .ok_or(BackupError::NoClassKey)?;
+            let items: Vec<u8> = manifest_key[4..].to_vec();
+            let result_key = unwrap_key(&class_key, &items)?;
             self.manifest_key_unwrapped = Some(result_key);
             trace!("unwrapped manifest key: {:x?}", self.manifest_key_unwrapped);
             debug!("unwrapped manifest key successfully!");
+            Ok(())
+        } else {
+            Err(BackupError::NoManifestKey)
         }
     }
 }

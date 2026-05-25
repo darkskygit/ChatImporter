@@ -1,6 +1,8 @@
 use plist::Value;
 
-pub fn decode_nskeyedarchiver(value: plist::Value) -> plist::Value {
+pub fn decode_nskeyedarchiver(
+    value: plist::Value,
+) -> Result<plist::Value, Box<dyn std::error::Error>> {
     let mut rot = plist::Dictionary::new();
 
     // First, ensure the top-level is a dictionary.
@@ -8,7 +10,7 @@ pub fn decode_nskeyedarchiver(value: plist::Value) -> plist::Value {
         // Next, ensure that this item is actually created by NSKeyedArchiver
         if let Some(Value::String(string)) = root.get("$archiver") {
             if string != "NSKeyedArchiver" {
-                panic!("not built by NSKeyedArchiver - bailing.");
+                return Err(invalid_archive("not built by NSKeyedArchiver"));
             }
         }
 
@@ -24,34 +26,47 @@ pub fn decode_nskeyedarchiver(value: plist::Value) -> plist::Value {
         // Try to get the object container
         let objects = match root.get("$objects") {
             Some(Value::Array(objs)) => objs,
-            _ => panic!("no objects!"),
+            _ => return Err(invalid_archive("no objects")),
         };
 
         // If we have a root uuid try to get it
         if let Some(root_uid) = top_uid {
-            let root = &objects[root_uid];
+            let root = objects
+                .get(root_uid)
+                .ok_or_else(|| invalid_archive("root uid out of bounds"))?;
             // read referenced object as dict
-            if let Some(dict) = root.as_dictionary() {
-                // for each key, unwrap it into it's referenced uid object or self.
-                for (k, v) in dict.iter() {
-                    match v {
-                        Value::Uid(uid) => {
-                            let uid = uid.get() as usize;
-                            let referenced = &objects[uid];
-                            rot.insert(k.to_string(), referenced.clone());
-                        }
-                        _ => {
-                            rot.insert(k.to_string(), v.clone());
-                        }
+            let dict = root
+                .as_dictionary()
+                .ok_or_else(|| invalid_archive("root object is not a dictionary"))?;
+
+            // for each key, unwrap it into it's referenced uid object or self.
+            for (k, v) in dict.iter() {
+                match v {
+                    Value::Uid(uid) => {
+                        let uid = uid.get() as usize;
+                        let referenced = objects
+                            .get(uid)
+                            .ok_or_else(|| invalid_archive("referenced uid out of bounds"))?;
+                        rot.insert(k.to_string(), referenced.clone());
+                    }
+                    _ => {
+                        rot.insert(k.to_string(), v.clone());
                     }
                 }
             }
         } else {
-            panic!("no root uid specified!");
+            return Err(invalid_archive("no root uid specified"));
         }
     } else {
-        panic!("malformed keyedarchiver - root is not dict.")
+        return Err(invalid_archive("malformed keyedarchiver root"));
     }
 
-    Value::Dictionary(rot)
+    Ok(Value::Dictionary(rot))
+}
+
+fn invalid_archive(message: &'static str) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    ))
 }

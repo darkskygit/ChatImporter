@@ -17,9 +17,9 @@ pub enum ProtectionClass {
     Unknown,
 }
 
-impl Into<u32> for ProtectionClass {
-    fn into(self) -> u32 {
-        match self {
+impl From<ProtectionClass> for u32 {
+    fn from(val: ProtectionClass) -> Self {
+        match val {
             ProtectionClass::NSFileProtectionComplete => 1,
             ProtectionClass::NSFileProtectionCompleteUnlessOpen => 2,
             ProtectionClass::NSFileProtectionCompleteUntilFirstUserAuthentication => 3,

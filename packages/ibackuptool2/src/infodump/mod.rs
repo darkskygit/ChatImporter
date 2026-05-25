@@ -29,7 +29,7 @@ impl SqliteProxy {
             None => return Err(BackupError::FileNotFound.into()),
         };
 
-        file.unwrap_file_key(backup);
+        file.unwrap_file_key(backup)?;
         let mut tmpfile = tempfile::NamedTempFile::new()?;
 
         tmpfile.write_all(backup.read_file(&file).expect("read to succeed").as_slice())?;

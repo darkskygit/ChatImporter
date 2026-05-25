@@ -9,7 +9,7 @@ pub struct Matcher {
 }
 
 impl Matcher {
-    pub fn new(
+    pub fn from_mht(
         data: &[u8],
         owner: String,
         file_name: String,
@@ -94,7 +94,7 @@ mod tests {
              --BOUNDARY--\r\n",
             html
         );
-        let matcher = Matcher::new(mht.as_bytes(), "owner".into(), "Bob(456)".into()).unwrap();
+        let matcher = Matcher::from_mht(mht.as_bytes(), "owner".into(), "Bob(456)".into()).unwrap();
         let records = matcher.get_records().unwrap();
         assert_eq!(records.len(), 1);
         let record = records[0].get_record();

@@ -1,3 +1,6 @@
+// Query APIs back the planned browsing/search UI and repair commands; the current CLI only writes.
+#![allow(dead_code)]
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -21,7 +24,8 @@ impl ChatStore {
     pub(super) async fn load_all_records(&self) -> Result<Vec<StoredRecord>> {
         Ok(sqlx::query_as::<_, StoredRecord>(
             r#"
-            SELECT id, chat_type, owner_id, group_id, sender_id, sender_name, content, timestamp, metadata
+            SELECT id, chat_type, owner_id, group_id, sender_id, sender_name, content, timestamp, metadata,
+                   source_kind, source_group_id, source_message_id, source_backup_id
             FROM chat_records
             "#,
         )
@@ -108,7 +112,8 @@ impl ChatStore {
     ) -> QueryBuilder<'q, Sqlite> {
         let mut builder = QueryBuilder::new(
             r#"
-            SELECT id, chat_type, owner_id, group_id, sender_id, sender_name, content, timestamp, metadata
+            SELECT id, chat_type, owner_id, group_id, sender_id, sender_name, content, timestamp, metadata,
+                   source_kind, source_group_id, source_message_id, source_backup_id
             FROM chat_records
             WHERE 1 = 1
             "#,
@@ -124,6 +129,28 @@ impl ChatStore {
         if let Some(value) = &query.group_id {
             builder.push(" AND group_id = ");
             builder.push_bind(value);
+        }
+        if let Some(value) = &query.conversation_key {
+            builder.push(
+                r#"
+                AND EXISTS (
+                    SELECT 1
+                    FROM chat_conversations c
+                    JOIN chat_conversation_sources s ON s.conversation_id = c.id
+                    WHERE c.chat_type = chat_records.chat_type
+                      AND c.owner_id = chat_records.owner_id
+                      AND c.conversation_key =
+                "#,
+            );
+            builder.push_bind(value);
+            builder.push(
+                r#"
+                      AND s.chat_type = chat_records.chat_type
+                      AND s.owner_id = chat_records.owner_id
+                      AND s.source_group_id = chat_records.group_id
+                )
+                "#,
+            );
         }
         if let Some(value) = &query.sender_id {
             builder.push(" AND sender_id = ");
@@ -146,6 +173,17 @@ impl ChatStore {
                 builder.push(" AND content LIKE ");
                 builder.push_bind(format!("%{}%", value));
             }
+        }
+        if !query.include_duplicates {
+            builder.push(
+                r#"
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM chat_record_duplicates d
+                    WHERE d.duplicate_record_id = chat_records.id
+                )
+                "#,
+            );
         }
         builder
     }

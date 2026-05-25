@@ -25,18 +25,19 @@ pub fn as_u32_le(array: &[u8]) -> u32 {
     if array.len() < 4 {
         panic!("cannot unpack u32 from smaller buffer.")
     }
-    ((array[0] as u32) << 0)
+    (array[0] as u32)
         + ((array[1] as u32) << 8)
         + ((array[2] as u32) << 16)
         + ((array[3] as u32) << 24)
 }
 
+// Kept for binary plist/keybag fields that are encoded big-endian in newer parser work.
 #[allow(dead_code)]
 pub fn as_u32_be(array: &[u8]) -> u32 {
     ((array[0] as u32) << 24)
         + ((array[1] as u32) << 16)
         + ((array[2] as u32) << 8)
-        + ((array[3] as u32) << 0)
+        + (array[3] as u32)
 }
 
 #[cfg(test)]
@@ -44,11 +45,11 @@ mod tests {
     #[test]
     fn test_u32_read() {
         assert_eq!(
-            super::as_u32_be(&[0xDE as u8, 0xAD as u8, 0xBE as u8, 0xEF as u8]),
+            super::as_u32_be(&[0xDE_u8, 0xAD_u8, 0xBE_u8, 0xEF_u8]),
             0xDEADBEEF
         );
         assert_eq!(
-            super::as_u32_le(&[0xEF as u8, 0xBE as u8, 0xAD as u8, 0xDE as u8]),
+            super::as_u32_le(&[0xEF_u8, 0xBE_u8, 0xAD_u8, 0xDE_u8]),
             0xDEADBEEF
         );
     }

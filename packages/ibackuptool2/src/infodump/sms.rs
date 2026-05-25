@@ -9,6 +9,8 @@ use std::time::{Duration, UNIX_EPOCH};
 const IPHONE_2001_EPOCH: i64 = 978307200000;
 
 #[derive(Debug)]
+// Mirrors iOS handle rows so future text/JSON dumps can expose handle metadata.
+#[allow(dead_code)]
 pub struct Sender {
     rowid: u32,
     id: String,
@@ -27,6 +29,7 @@ impl Sender {
         }
     }
 
+    // Useful when exporting standalone conversations that synthesize a local sender.
     #[allow(dead_code)]
     fn me() -> Sender {
         Sender {
@@ -39,6 +42,8 @@ impl Sender {
 }
 
 #[derive(Debug)]
+// Mirrors iOS message rows so future SMS dumps can include read/delivered timestamps.
+#[allow(dead_code)]
 pub struct Message {
     rowid: u32,
     from: Option<Sender>,
@@ -50,6 +55,8 @@ pub struct Message {
 }
 
 #[derive(Debug)]
+// Mirrors iOS chat rows so future SMS dumps can include chat guid/group participants.
+#[allow(dead_code)]
 pub struct Conversation {
     id: u32,
     guid: String,
@@ -76,10 +83,7 @@ pub fn find_person(conn: &Connection, handle_id: u32) -> Option<Sender> {
         .unwrap();
 
     match person_iter.next() {
-        Some(v) => match v {
-            Ok(v) => Some(v),
-            Err(_) => None,
-        },
+        Some(v) => v.ok(),
         None => None,
     }
 }
@@ -119,9 +123,8 @@ pub fn find_people(conn: &Connection, chat_id: u32) -> Vec<Sender> {
 
     for handle_id in handle_id_iter {
         let handle_id = handle_id.unwrap();
-        match find_person(&conn, handle_id) {
-            Some(p) => out.push(p),
-            None => {}
+        if let Some(p) = find_person(conn, handle_id) {
+            out.push(p)
         }
     }
 
@@ -164,13 +167,13 @@ pub fn read_chats(conn: &Connection) -> Vec<Conversation> {
                 chat_identifier: row.get(2)?,
                 display_name: row.get(3)?,
                 group_id: row.get(4)?,
-                participants: find_people(&conn, chat_id),
-                messages: find_messages(&conn, chat_id),
+                participants: find_people(conn, chat_id),
+                messages: find_messages(conn, chat_id),
             })
         })
         .unwrap();
 
-    let convos: Vec<Conversation> = chat_iter.flat_map(|v| v).collect();
+    let convos: Vec<Conversation> = chat_iter.flatten().collect();
 
     convos
 }
@@ -207,23 +210,20 @@ pub fn localize_sender_id(
     match person {
         None => {}
         Some(contact) => {
-            let components = vec![
+            let components = [
                 contact.first.as_ref(),
                 contact.middle.as_ref(),
                 contact.last.as_ref(),
             ];
             let outname = components
                 .iter()
-                .flat_map(|v| match v {
-                    Some(v) => Ok(v.clone()),
-                    None => Err(()),
-                })
+                .filter_map(|component| component.as_ref().copied())
                 .collect::<Vec<&String>>();
 
             let mut out_addr = String::new();
             for component in outname {
-                out_addr.extend(component.chars());
-                out_addr.extend(" ".chars());
+                out_addr.push_str(component);
+                out_addr.push(' ');
             }
 
             sender_name = format!("{} <{}>", out_addr.trim_end(), sender_name);
@@ -262,7 +262,7 @@ impl TextOutputFormat for SMSReader {
 
         for chat in &self.chats {
             let mut chat_name_display = chat.display_name.clone();
-            if chat_name_display.len() == 0 {
+            if chat_name_display.is_empty() {
                 chat_name_display = chat.chat_identifier.clone();
             }
 

@@ -14,7 +14,7 @@ pub struct ChatStore {
     pub(super) pool: SqlitePool,
     pub(super) assets: SqliteStore,
     pub(super) index: InMemoryIndex,
-    pending_assets: Mutex<HashMap<Hash32, Vec<u8>>>,
+    pub(super) pending_assets: Mutex<HashMap<Hash32, Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -28,6 +28,10 @@ pub(super) struct StoredRecord {
     pub(super) content: String,
     pub(super) timestamp: i64,
     pub(super) metadata: Option<Vec<u8>>,
+    pub(super) source_kind: Option<String>,
+    pub(super) source_group_id: Option<String>,
+    pub(super) source_message_id: Option<String>,
+    pub(super) source_backup_id: Option<String>,
 }
 
 impl From<StoredRecord> for Record {
@@ -42,6 +46,10 @@ impl From<StoredRecord> for Record {
             content: record.content,
             timestamp: record.timestamp,
             metadata: record.metadata,
+            source_kind: record.source_kind,
+            source_group_id: record.source_group_id,
+            source_message_id: record.source_message_id,
+            source_backup_id: record.source_backup_id,
         }
     }
 }
@@ -74,17 +82,6 @@ impl ChatStore {
         };
         store.rebuild_index().await?;
         Ok(store)
-    }
-
-    pub async fn get_asset(&self, hash: Hash32) -> Result<Option<Vec<u8>>> {
-        if let Some(bytes) = self.pending_assets.lock().await.get(&hash).cloned() {
-            return Ok(Some(bytes));
-        }
-        Ok(self
-            .assets
-            .get_object(&hash)
-            .await?
-            .map(|object| object.content))
     }
 
     pub(super) async fn set_pending_assets(&self, attachments: &Attachments) {

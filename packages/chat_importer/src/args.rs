@@ -42,9 +42,11 @@ pub enum SubCommand {
         path: Vec<PathBuf>,
     },
     #[structopt(name = "sms", about = "import sms from ios backup")]
-    SMS {
+    Sms {
         #[structopt(short = "o", default_value = "DarkSky")]
         owner: String,
+        #[structopt(long = "owner-id")]
+        owner_id: Option<String>,
         #[structopt(name = "DIR", parse(try_from_str = check_path))]
         path: Vec<PathBuf>,
     },
@@ -70,7 +72,7 @@ impl Args {
                 })
                 .filter(|p| p.is_file())
                 .collect(),
-            SubCommand::WeChat { path, .. } | SubCommand::SMS { path, .. } => path
+            SubCommand::WeChat { path, .. } | SubCommand::Sms { path, .. } => path
                 .iter()
                 .map(PathBuf::from)
                 .filter(PathBuf::is_dir)

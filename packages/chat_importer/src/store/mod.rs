@@ -1,3 +1,5 @@
+mod assets;
+mod conversations;
 mod core;
 mod query;
 pub mod schema;
@@ -5,7 +7,10 @@ pub mod types;
 mod write;
 
 pub use core::ChatStore;
-pub use types::{Attachments, MetadataMerger, Query, Record, RecordType};
+pub use types::{
+    AssetWriteOutcome, Attachments, ConversationMergePreview, ConversationMergeRequest,
+    MetadataMerger, Query, Record, RecordDuplicateCandidate, RecordType, WriteOutcome,
+};
 
 const INDEX_NAME: &str = "chat_records";
 
@@ -63,9 +68,18 @@ mod tests {
             .insert_record_tx(&mut tx, &record("hello", 1))
             .await
             .unwrap();
-        let hash = store.put_asset_tx(&mut tx, b"asset").await.unwrap();
+        let asset = store
+            .put_asset_tx(&mut tx, "asset.bin", b"asset")
+            .await
+            .unwrap();
         store
-            .upsert_attachment_tx(&mut tx, record_id, "asset", hash)
+            .upsert_attachment_tx(
+                &mut tx,
+                record_id,
+                "asset",
+                asset.asset_hash,
+                asset.canonical_asset_hash,
+            )
             .await
             .unwrap();
         tx.rollback().await.unwrap();
@@ -102,6 +116,481 @@ mod tests {
         let records = store.query(Query::default()).await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].content, "updated");
+    }
+
+    #[tokio::test]
+    async fn source_identity_updates_existing_record_when_legacy_key_changes() {
+        let (_dir, mut store) = store().await;
+        let mut first = record("first", 1);
+        first.source_kind = Some("ios-sms".into());
+        first.source_group_id = Some("source-group-a".into());
+        first.source_message_id = Some("message-1".into());
+        first.source_backup_id = Some("backup-a".into());
+        store
+            .insert_or_update(RecordType::from(first), None)
+            .await
+            .unwrap();
+
+        let mut updated = record("updated", 99);
+        updated.group_id = "source-group-b".into();
+        updated.sender_id = "sender-2".into();
+        updated.source_kind = Some("ios-sms".into());
+        updated.source_group_id = Some("source-group-b".into());
+        updated.source_message_id = Some("message-1".into());
+        updated.source_backup_id = Some("backup-b".into());
+        store
+            .insert_or_update(RecordType::from(updated), None)
+            .await
+            .unwrap();
+
+        let records = store.query(Query::default()).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "updated");
+        assert_eq!(records[0].group_id, "source-group-b");
+        assert_eq!(records[0].sender_id, "sender-2");
+        assert_eq!(records[0].timestamp, 99);
+        assert_eq!(
+            records[0].source_group_id.as_deref(),
+            Some("source-group-b")
+        );
+        assert_eq!(records[0].source_backup_id.as_deref(), Some("backup-b"));
+    }
+
+    #[tokio::test]
+    async fn records_without_source_identity_keep_legacy_key_behavior() {
+        let (_dir, mut store) = store().await;
+        store
+            .insert_or_update(RecordType::from(record("first", 1)), None)
+            .await
+            .unwrap();
+
+        let mut changed_legacy_key = record("second", 2);
+        changed_legacy_key.group_id = "other-group".into();
+        store
+            .insert_or_update(RecordType::from(changed_legacy_key), None)
+            .await
+            .unwrap();
+
+        let records = store.query(Query::default()).await.unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn distinct_source_identities_do_not_fallback_to_legacy_key() {
+        let (_dir, mut store) = store().await;
+        let mut first = record("first", 1);
+        first.source_kind = Some("ios-sms".into());
+        first.source_group_id = Some("source-group".into());
+        first.source_message_id = Some("message-1".into());
+        first.source_backup_id = Some("backup-a".into());
+        store
+            .insert_or_update(RecordType::from(first), None)
+            .await
+            .unwrap();
+
+        let mut second = record("second", 1);
+        second.source_kind = Some("ios-sms".into());
+        second.source_group_id = Some("source-group".into());
+        second.source_message_id = Some("message-2".into());
+        second.source_backup_id = Some("backup-a".into());
+        store
+            .insert_or_update(RecordType::from(second), None)
+            .await
+            .unwrap();
+
+        let records = store.query(Query::default()).await.unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .any(|record| record.source_message_id.as_deref() == Some("message-1")));
+        assert!(records
+            .iter()
+            .any(|record| record.source_message_id.as_deref() == Some("message-2")));
+    }
+
+    #[tokio::test]
+    async fn source_identity_import_falls_back_to_legacy_record_without_source_identity() {
+        let (_dir, mut store) = store().await;
+        store
+            .insert_or_update(RecordType::from(record("legacy", 1)), None)
+            .await
+            .unwrap();
+
+        let mut sourced = record("sourced", 1);
+        sourced.source_kind = Some("ios-sms".into());
+        sourced.source_group_id = Some("group".into());
+        sourced.source_message_id = Some("message-1".into());
+        sourced.source_backup_id = Some("backup-a".into());
+        store
+            .insert_or_update(RecordType::from(sourced), None)
+            .await
+            .unwrap();
+
+        let records = store
+            .query(Query {
+                include_duplicates: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "sourced");
+        assert_eq!(records[0].source_message_id.as_deref(), Some("message-1"));
+    }
+
+    #[tokio::test]
+    async fn source_identity_import_falls_back_to_partial_source_legacy_record() {
+        let (_dir, mut store) = store().await;
+        let mut partial = record("partial", 1);
+        partial.source_kind = Some("ios-sms".into());
+        partial.source_group_id = Some("group".into());
+        store
+            .insert_or_update(RecordType::from(partial), None)
+            .await
+            .unwrap();
+
+        let mut complete = record("complete", 1);
+        complete.source_kind = Some("ios-sms".into());
+        complete.source_group_id = Some("group".into());
+        complete.source_message_id = Some("message-1".into());
+        complete.source_backup_id = Some("backup-a".into());
+        store
+            .insert_or_update(RecordType::from(complete), None)
+            .await
+            .unwrap();
+
+        let records = store
+            .query(Query {
+                include_duplicates: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "complete");
+        assert_eq!(records[0].source_message_id.as_deref(), Some("message-1"));
+    }
+
+    #[tokio::test]
+    async fn default_conversation_mapping_matches_source_group_query() {
+        let (_dir, mut store) = store().await;
+        let mut wechat = record("wechat", 1);
+        wechat.chat_type = "WeChat".into();
+        wechat.group_id = "wx-contact".into();
+        store
+            .insert_or_update(RecordType::from(wechat), None)
+            .await
+            .unwrap();
+
+        let mut qq = record("qq", 2);
+        qq.chat_type = "QQ".into();
+        qq.group_id = "qq-contact".into();
+        store
+            .insert_or_update(RecordType::from(qq), None)
+            .await
+            .unwrap();
+
+        for (chat_type, group_id, content) in [
+            ("WeChat", "wx-contact", "wechat"),
+            ("QQ", "qq-contact", "qq"),
+        ] {
+            let by_group = store
+                .query(Query {
+                    chat_type: Some(chat_type.into()),
+                    group_id: Some(group_id.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let by_conversation = store
+                .query(Query {
+                    chat_type: Some(chat_type.into()),
+                    conversation_key: Some(group_id.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(by_group, by_conversation);
+            assert_eq!(by_conversation[0].content, content);
+        }
+    }
+
+    #[tokio::test]
+    async fn merged_sms_conversation_queries_logical_without_rewriting_source_groups() {
+        let (_dir, mut store) = store().await;
+        let mut first = record("first sms", 1);
+        first.chat_type = "iOS SMS".into();
+        first.group_id = "sms-chat-a".into();
+        first.source_kind = Some("ios-sms".into());
+        first.source_message_id = Some("sms-1".into());
+        store
+            .insert_or_update(RecordType::from(first), None)
+            .await
+            .unwrap();
+
+        let mut second = record("second sms", 2);
+        second.chat_type = "iOS SMS".into();
+        second.group_id = "sms-chat-b".into();
+        second.source_kind = Some("ios-sms".into());
+        second.source_message_id = Some("sms-2".into());
+        store
+            .insert_or_update(RecordType::from(second), None)
+            .await
+            .unwrap();
+
+        store
+            .apply_conversation_merge(ConversationMergeRequest {
+                chat_type: "iOS SMS".into(),
+                owner_id: "owner".into(),
+                source_group_ids: vec!["sms-chat-a".into(), "sms-chat-b".into()],
+                target_conversation_key: "merged-sms".into(),
+                display_name: Some("Merged SMS".into()),
+            })
+            .await
+            .unwrap();
+
+        let logical = store
+            .query(Query {
+                chat_type: Some("iOS SMS".into()),
+                conversation_key: Some("merged-sms".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logical.len(), 2);
+        assert_eq!(
+            logical
+                .iter()
+                .map(|record| record.group_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sms-chat-b", "sms-chat-a"]
+        );
+
+        let source = store
+            .query(Query {
+                chat_type: Some("iOS SMS".into()),
+                group_id: Some("sms-chat-a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(source.len(), 1);
+        assert_eq!(source[0].group_id, "sms-chat-a");
+    }
+
+    #[tokio::test]
+    async fn conversation_merge_rejects_cross_owner_source_groups() {
+        let (_dir, mut store) = store().await;
+        let mut owner_a = record("owner a", 1);
+        owner_a.group_id = "owner-a-group".into();
+        store
+            .insert_or_update(RecordType::from(owner_a), None)
+            .await
+            .unwrap();
+
+        let mut owner_b = record("owner b", 2);
+        owner_b.owner_id = "other-owner".into();
+        owner_b.group_id = "owner-b-group".into();
+        store
+            .insert_or_update(RecordType::from(owner_b), None)
+            .await
+            .unwrap();
+
+        let error = store
+            .apply_conversation_merge(ConversationMergeRequest {
+                chat_type: "chat".into(),
+                owner_id: "owner".into(),
+                source_group_ids: vec!["owner-a-group".into(), "owner-b-group".into()],
+                target_conversation_key: "merged".into(),
+                display_name: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("different chat_type or owner_id"));
+    }
+
+    #[tokio::test]
+    async fn conversation_source_foreign_key_rejects_mismatched_owner() {
+        let (_dir, store) = store().await;
+        sqlx::query(
+            r#"
+            INSERT INTO chat_conversations
+              (chat_type, owner_id, conversation_key, created_at, updated_at)
+            VALUES ('chat', 'owner-a', 'conversation', 1, 1)
+            "#,
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let conversation_id: i64 = sqlx::query_scalar("SELECT id FROM chat_conversations")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO chat_conversation_sources
+              (conversation_id, chat_type, owner_id, source_group_id, created_at, updated_at)
+            VALUES (?1, 'chat', 'owner-b', 'source', 1, 1)
+            "#,
+        )
+        .bind(conversation_id)
+        .execute(&store.pool)
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn similar_records_without_source_id_are_preview_candidates_only() {
+        let (_dir, mut store) = store().await;
+        let mut first = record("same content", 100);
+        first.group_id = "group-a".into();
+        store
+            .insert_or_update(RecordType::from(first), None)
+            .await
+            .unwrap();
+        let mut second = record("same   content", 101);
+        second.group_id = "group-b".into();
+        store
+            .insert_or_update(RecordType::from(second), None)
+            .await
+            .unwrap();
+
+        let preview = store
+            .preview_conversation_merge(&ConversationMergeRequest {
+                chat_type: "chat".into(),
+                owner_id: "owner".into(),
+                source_group_ids: vec!["group-a".into(), "group-b".into()],
+                target_conversation_key: "merged".into(),
+                display_name: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(preview.duplicate_candidates.len(), 1);
+        assert_eq!(preview.duplicate_candidates[0].reason, "fuzzy-content-time");
+
+        store
+            .apply_conversation_merge(ConversationMergeRequest {
+                chat_type: "chat".into(),
+                owner_id: "owner".into(),
+                source_group_ids: vec!["group-a".into(), "group-b".into()],
+                target_conversation_key: "merged".into(),
+                display_name: None,
+            })
+            .await
+            .unwrap();
+        let records = store
+            .query(Query {
+                conversation_key: Some("merged".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn split_conversation_source_moves_one_source_mapping_only() {
+        let (_dir, mut store) = store().await;
+        let mut first = record("first sms", 1);
+        first.group_id = "sms-chat-a".into();
+        store
+            .insert_or_update(RecordType::from(first), None)
+            .await
+            .unwrap();
+        let mut second = record("second sms", 2);
+        second.group_id = "sms-chat-b".into();
+        store
+            .insert_or_update(RecordType::from(second), None)
+            .await
+            .unwrap();
+        store
+            .apply_conversation_merge(ConversationMergeRequest {
+                chat_type: "chat".into(),
+                owner_id: "owner".into(),
+                source_group_ids: vec!["sms-chat-a".into(), "sms-chat-b".into()],
+                target_conversation_key: "merged".into(),
+                display_name: None,
+            })
+            .await
+            .unwrap();
+
+        store
+            .split_conversation_source("chat", "owner", "sms-chat-b", "split-b")
+            .await
+            .unwrap();
+
+        let merged = store
+            .query(Query {
+                conversation_key: Some("merged".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].group_id, "sms-chat-a");
+
+        let split = store
+            .query(Query {
+                conversation_key: Some("split-b".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].group_id, "sms-chat-b");
+    }
+
+    #[tokio::test]
+    async fn explicit_duplicate_marks_hide_records_unless_included() {
+        let (_dir, mut store) = store().await;
+        store
+            .insert_or_update(RecordType::from(record("canonical", 1)), None)
+            .await
+            .unwrap();
+        let mut duplicate = record("duplicate", 2);
+        duplicate.sender_id = "sender-2".into();
+        store
+            .insert_or_update(RecordType::from(duplicate), None)
+            .await
+            .unwrap();
+
+        let all = store
+            .query(Query {
+                include_duplicates: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let canonical_id = all
+            .iter()
+            .find(|record| record.content == "canonical")
+            .and_then(|record| record.id)
+            .unwrap();
+        let duplicate_id = all
+            .iter()
+            .find(|record| record.content == "duplicate")
+            .and_then(|record| record.id)
+            .unwrap();
+        store
+            .mark_duplicate_records(canonical_id, &[duplicate_id], "manual")
+            .await
+            .unwrap();
+
+        let visible = store.query(Query::default()).await.unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].content, "canonical");
+
+        let with_duplicates = store
+            .query(Query {
+                include_duplicates: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(with_duplicates.len(), 2);
     }
 
     struct ReplaceMerger;
@@ -231,11 +720,41 @@ mod tests {
             .fetch_one(&store.pool)
             .await
             .unwrap();
-        assert_eq!(object_count, 1);
+        assert_eq!(object_count, 2);
+        let recipe_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM file_recipe_cache")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(recipe_count, 1);
         assert_eq!(
             store.get_asset(Hash32::sha3_256(&data)).await.unwrap(),
             Some(data)
         );
+    }
+
+    #[tokio::test]
+    async fn get_asset_reads_legacy_raw_object_without_recipe() {
+        let (_dir, store) = store().await;
+        let data = b"legacy raw bytes".to_vec();
+        let hash = Hash32::sha3_256(&data);
+        let mut tx = store.pool.begin().await.unwrap();
+        store
+            .assets
+            .put_objects_batch_tx(
+                &mut tx,
+                &[assetpack_core::pack::ObjectRecord {
+                    hash,
+                    kind: assetpack_core::ObjectKind::Chunk,
+                    size: data.len() as u64,
+                    codec: assetpack_core::Codec::Raw,
+                    content: data.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(store.get_asset(hash).await.unwrap(), Some(data));
     }
 
     #[tokio::test]

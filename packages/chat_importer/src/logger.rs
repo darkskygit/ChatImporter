@@ -4,6 +4,7 @@ use log::{LevelFilter, Log, Metadata, Record};
 pub fn init_logger(level: LevelFilter) -> Result<(), log::SetLoggerError> {
     Dispatch::new()
         .level(level)
+        .level_for("lepton_jpeg", LevelFilter::Warn)
         .format(move |out, message, record| {
             out.finish(format_args!(
                 "{}[{:>5}][{}] {}",

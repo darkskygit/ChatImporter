@@ -24,7 +24,7 @@ impl KeyBag {
     /// Find unwrapped key for a protection class.
     /// Requires the backup be unlocked first.
     pub fn find_class_key(&self, class: &ProtectionClass) -> Option<Vec<u8>> {
-        for ref key in &self.keys {
+        for key in &self.keys {
             if key.class == *class {
                 return key.key.clone();
             }
@@ -46,7 +46,6 @@ pub struct KeybagEntry {
 #[derive(Debug, Clone)]
 pub struct BackupKeyBagBlock {
     tag: KeybagBlockTag,
-    length: usize,
     data: Vec<u8>,
 }
 
@@ -59,7 +58,7 @@ impl KeyBag {
             if block.tag == KeybagBlockTag::UUID {
                 found_uuid_count += 1;
 
-                if found_uuid_count > 2 && section.len() > 0 {
+                if found_uuid_count > 2 && !section.is_empty() {
                     sections.push(section.clone());
                     section.clear();
                 }
@@ -91,12 +90,12 @@ impl KeyBag {
         root_entries
     }
 
-    pub fn unlock_with_key(&mut self, passcode_key: Vec<u8>) {
+    pub fn unlock_with_key(&mut self, passcode_key: Vec<u8>) -> Result<(), BackupError> {
         self.key = Some(passcode_key.clone());
 
         for key in self.keys.iter_mut() {
             // let k = key.wpky;
-            key.key = Some(super::aes::unwrap_key(&passcode_key, &key.wpky));
+            key.key = Some(super::aes::unwrap_key(&passcode_key, &key.wpky)?);
         }
 
         info!("unwrapped {} keys.", self.keys.len());
@@ -120,6 +119,7 @@ impl KeyBag {
                 ),
             }
         }
+        Ok(())
 
         //     def unlockWithPasscode(self, passcode, passcode_key=None):
         // if passcode_key is None:
@@ -143,16 +143,19 @@ impl KeyBag {
         // return True
     }
 
-    pub fn unlock_with_passcode(&mut self, passcode: &str) {
+    pub fn unlock_with_passcode(&mut self, passcode: &str) -> Result<(), BackupError> {
         info!("deriving keys...");
         #[cfg(debug_assertions)]
         warn!("key derivation is slow in non-release mode.");
         let mut passcode1: Vec<u8> = vec![0u8; 32];
         let mut passcode_key: Vec<u8> = vec![0u8; 32];
 
-        let dpic = self.dpic.unwrap();
-        let iterations = self.iterations.unwrap();
-        let double_protection_salt = self.double_protection_salt.as_ref().unwrap();
+        let dpic = self.dpic.ok_or(BackupError::InvalidKeybag)?;
+        let iterations = self.iterations.ok_or(BackupError::InvalidKeybag)?;
+        let double_protection_salt = self
+            .double_protection_salt
+            .as_ref()
+            .ok_or(BackupError::InvalidKeybag)?;
 
         debug!("dpic: {}", dpic);
         debug!("dpsl: {:?}", double_protection_salt);
@@ -164,8 +167,8 @@ impl KeyBag {
         // 1. Round of pbkdf2-sha256(passcode)
         pbkdf2::derive(
             pbkdf2::PBKDF2_HMAC_SHA256,
-            std::num::NonZeroU32::new(dpic as u32).unwrap(),
-            &double_protection_salt.as_slice(),
+            std::num::NonZeroU32::new(dpic).ok_or(BackupError::InvalidKeybag)?,
+            double_protection_salt.as_slice(),
             passcode.as_bytes(),
             passcode1.as_mut_slice(),
         );
@@ -175,8 +178,8 @@ impl KeyBag {
         debug!("2. pbkdf2-sha2(it: {}, ps: <redacted>)", iterations);
         pbkdf2::derive(
             pbkdf2::PBKDF2_HMAC_SHA1,
-            std::num::NonZeroU32::new(iterations as u32).unwrap(),
-            &self.salt.as_slice(),
+            std::num::NonZeroU32::new(iterations).ok_or(BackupError::InvalidKeybag)?,
+            self.salt.as_slice(),
             passcode1.as_slice(),
             passcode_key.as_mut_slice(),
         );
@@ -187,10 +190,10 @@ impl KeyBag {
         // crypto::pbkdf2::pbkdf2(&mut mac, &self.double_protection_salt.as_slice(), self.dpic, passcode1.as_mut_slice());
         // crypto::pbkdf2::pbkdf2(&mut sha1, &self.salt.as_slice(), self.iterations, passcode_key.as_mut_slice());
 
-        self.unlock_with_key(passcode_key);
+        self.unlock_with_key(passcode_key)
     }
 
-    fn init_keybag(root_blocks: Vec<BackupKeyBagBlock>) -> KeyBag {
+    fn init_keybag(root_blocks: Vec<BackupKeyBagBlock>) -> Result<KeyBag, BackupError> {
         let mut version: Option<u32> = None;
         let mut kind: Option<KeybagTypes> = None;
         let mut uuid: Option<Uuid> = None;
@@ -205,36 +208,44 @@ impl KeyBag {
         for block in root_blocks {
             match block.tag {
                 KeybagBlockTag::UUID => {
-                    uuid = Some(Uuid::parse_str(&hex::encode(&block.data)).unwrap());
+                    uuid = Some(
+                        Uuid::parse_str(&hex::encode(&block.data))
+                            .map_err(|_| BackupError::InvalidKeybag)?,
+                    );
                     debug!("found uuid: {:?}", uuid);
                 }
                 KeybagBlockTag::VERS => {
                     version = Some(u32::from_be_bytes(
-                        KeyBag::get_u8_4(block.data.as_slice()).unwrap(),
+                        KeyBag::get_u8_4(block.data.as_slice())
+                            .ok_or(BackupError::InvalidKeybag)?,
                     ));
                     debug!("found version: {:?}", version);
                 }
                 KeybagBlockTag::TYPE => {
                     kind = Some(KeybagTypes::from(u32::from_be_bytes(
-                        KeyBag::get_u8_4(block.data.as_slice()).unwrap(),
+                        KeyBag::get_u8_4(block.data.as_slice())
+                            .ok_or(BackupError::InvalidKeybag)?,
                     )));
                     debug!("found kind: {:?}", kind);
                 }
                 KeybagBlockTag::ITER => {
                     iterations = Some(u32::from_be_bytes(
-                        KeyBag::get_u8_4(block.data.as_slice()).unwrap(),
+                        KeyBag::get_u8_4(block.data.as_slice())
+                            .ok_or(BackupError::InvalidKeybag)?,
                     ));
                     debug!("found iterations: {:?}", iterations);
                 }
                 KeybagBlockTag::DPWT => {
                     dpwt = Some(u32::from_be_bytes(
-                        KeyBag::get_u8_4(block.data.as_slice()).unwrap(),
+                        KeyBag::get_u8_4(block.data.as_slice())
+                            .ok_or(BackupError::InvalidKeybag)?,
                     ));
                     debug!("found dpwt: {:?}", dpwt);
                 }
                 KeybagBlockTag::DPIC => {
                     dpic = Some(u32::from_be_bytes(
-                        KeyBag::get_u8_4(block.data.as_slice()).unwrap(),
+                        KeyBag::get_u8_4(block.data.as_slice())
+                            .ok_or(BackupError::InvalidKeybag)?,
                     ));
                     debug!("found dpic: {:?}", dpic);
                 }
@@ -252,7 +263,8 @@ impl KeyBag {
                 }
                 KeybagBlockTag::WRAP => {
                     wrap = Some(u32::from_be_bytes(
-                        KeyBag::get_u8_4(block.data.as_slice()).unwrap(),
+                        KeyBag::get_u8_4(block.data.as_slice())
+                            .ok_or(BackupError::InvalidKeybag)?,
                     ));
                     debug!("found hmck: {:?}", hmck);
                 }
@@ -262,23 +274,23 @@ impl KeyBag {
             }
         }
 
-        KeyBag {
-            version: version.unwrap(),
-            uuid: uuid.unwrap(),
-            kind: kind.unwrap(),
+        Ok(KeyBag {
+            version: version.ok_or(BackupError::InvalidKeybag)?,
+            uuid: uuid.ok_or(BackupError::InvalidKeybag)?,
+            kind: kind.ok_or(BackupError::InvalidKeybag)?,
             iterations,
             dpwt,
             dpic,
             double_protection_salt,
-            salt: salt.unwrap(),
-            hmck: hmck.unwrap(),
-            wrap: wrap.unwrap(),
+            salt: salt.ok_or(BackupError::InvalidKeybag)?,
+            hmck: hmck.ok_or(BackupError::InvalidKeybag)?,
+            wrap: wrap.ok_or(BackupError::InvalidKeybag)?,
             keys: vec![],
             key: None,
-        }
+        })
     }
 
-    fn init_container(blocks: &Vec<BackupKeyBagBlock>) -> KeybagEntry {
+    fn init_container(blocks: &Vec<BackupKeyBagBlock>) -> Result<KeybagEntry, BackupError> {
         let mut uuid: Option<Uuid> = None;
         let mut class: Option<ProtectionClass> = None;
         let mut key_type: Option<KeyTypes> = None;
@@ -288,24 +300,30 @@ impl KeyBag {
         for block in blocks {
             match block.tag {
                 KeybagBlockTag::UUID => {
-                    uuid = Some(Uuid::parse_str(&hex::encode(&block.data)).unwrap());
+                    uuid = Some(
+                        Uuid::parse_str(&hex::encode(&block.data))
+                            .map_err(|_| BackupError::InvalidKeybag)?,
+                    );
                     debug!("found uuid: {:?}", uuid);
                 }
                 KeybagBlockTag::CLAS => {
                     class = Some(ProtectionClass::from(u32::from_be_bytes(
-                        KeyBag::get_u8_4(block.data.as_slice()).unwrap(),
+                        KeyBag::get_u8_4(block.data.as_slice())
+                            .ok_or(BackupError::InvalidKeybag)?,
                     )));
                     debug!("found protclass: {:?}", class);
                 }
                 KeybagBlockTag::KTYP => {
                     key_type = Some(KeyTypes::from(u32::from_be_bytes(
-                        KeyBag::get_u8_4(block.data.as_slice()).unwrap(),
+                        KeyBag::get_u8_4(block.data.as_slice())
+                            .ok_or(BackupError::InvalidKeybag)?,
                     )));
                     debug!("found keytype: {:?}", key_type);
                 }
                 KeybagBlockTag::WRAP => {
                     wrap = Some(u32::from_be_bytes(
-                        KeyBag::get_u8_4(block.data.as_slice()).unwrap(),
+                        KeyBag::get_u8_4(block.data.as_slice())
+                            .ok_or(BackupError::InvalidKeybag)?,
                     ));
                     debug!("found wrapper: {:?}", wrap);
                 }
@@ -317,30 +335,30 @@ impl KeyBag {
             };
         }
 
-        KeybagEntry {
-            uuid: uuid.unwrap(),
-            class: class.unwrap(),
-            key_type: key_type.unwrap(),
-            wrap: wrap.unwrap(),
-            wpky: wpky.unwrap(),
+        Ok(KeybagEntry {
+            uuid: uuid.ok_or(BackupError::InvalidKeybag)?,
+            class: class.ok_or(BackupError::InvalidKeybag)?,
+            key_type: key_type.ok_or(BackupError::InvalidKeybag)?,
+            wrap: wrap.ok_or(BackupError::InvalidKeybag)?,
+            wpky: wpky.ok_or(BackupError::InvalidKeybag)?,
             key: None,
-        }
+        })
     }
 
-    pub fn init(data: Vec<u8>) -> KeyBag {
-        let blocks = KeyBag::parse_tlb_blocks(data).unwrap();
+    pub fn init(data: Vec<u8>) -> Result<KeyBag, BackupError> {
+        let blocks = KeyBag::parse_tlb_blocks(data).ok_or(BackupError::InvalidKeybag)?;
         let root_blocks = KeyBag::find_root_blocks(&blocks);
         let contained_entries = KeyBag::find_contained_blocks(&blocks);
 
         // debug!("root: {:#?}", root_blocks);
         // debug!("contained: {:#?}", contained_entries);
-        let mut keybag = KeyBag::init_keybag(root_blocks);
+        let mut keybag = KeyBag::init_keybag(root_blocks)?;
         keybag.keys = contained_entries
             .iter()
-            .map(|v| KeyBag::init_container(v))
-            .collect::<Vec<KeybagEntry>>();
+            .map(KeyBag::init_container)
+            .collect::<Result<Vec<KeybagEntry>, BackupError>>()?;
 
-        keybag
+        Ok(keybag)
     }
 
     fn get_u8_4(vec: &[u8]) -> Option<[u8; 4]> {
@@ -359,17 +377,17 @@ impl KeyBag {
         while i + 8 < data.len() {
             let tag = match std::str::from_utf8(&data[i..i + 4]) {
                 Ok(res) => KeybagBlockTag::from(res),
-                Err(err) => panic!("Error parsing key type: {}", err),
+                Err(_) => return None,
             };
-            let x: [u8; 4] = match KeyBag::get_u8_4(&data[i + 4..i + 8]) {
-                Some(el) => el,
-                None => return None,
-            };
+            let x: [u8; 4] = KeyBag::get_u8_4(&data[i + 4..i + 8])?;
             let length = u32::from_be_bytes(x) as usize;
+            if i + 8 + length > data.len() {
+                return None;
+            }
             let data = Vec::from(&data[i + 8..i + 8 + length]);
 
             debug!("tag: {:?}, length: {}", tag, length);
-            blocks.push(BackupKeyBagBlock { tag, length, data });
+            blocks.push(BackupKeyBagBlock { tag, data });
 
             i += 8 + length;
         }

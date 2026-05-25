@@ -1,24 +1,50 @@
 use anyhow::Result;
-use assetpack_core::pack::ObjectRecord;
-use assetpack_core::{Codec, Hash32, ObjectKind, StoreWriteTx};
+use assetpack_core::{Hash32, StoreWriteTx};
 use chrono::Utc;
 
 use super::core::StoredRecord;
-use super::{ChatStore, MetadataMerger, Record, RecordType};
+use super::{ChatStore, MetadataMerger, Record, RecordType, WriteOutcome};
 
 impl ChatStore {
+    // Compatibility wrapper for callers that only need inserted/updated success, while import
+    // reporting now uses insert_or_update_detailed for metrics.
+    #[allow(dead_code)]
     pub async fn insert_or_update(
         &mut self,
         record: RecordType,
         merger: Option<&dyn MetadataMerger>,
     ) -> Result<bool> {
+        self.insert_or_update_detailed(record, merger, || {})
+            .await
+            .map(|_| true)
+    }
+
+    pub async fn insert_or_update_detailed<F>(
+        &mut self,
+        record: RecordType,
+        merger: Option<&dyn MetadataMerger>,
+        mut on_asset_written: F,
+    ) -> Result<WriteOutcome>
+    where
+        F: FnMut(),
+    {
         let (mut record, attachments) = record.into_parts();
+        let attachments_seen = attachments.len();
+        let attachment_original_bytes = attachments
+            .values()
+            .map(|bytes| bytes.len() as u64)
+            .sum::<u64>();
         let old = self.find_existing(&record).await?;
+        let record_inserted = old.is_none();
+        let record_updated = old.is_some();
         let mut tx = self.pool.begin().await?;
         let mut asset_hashes = Vec::with_capacity(attachments.len());
+        let mut asset_outcomes = Vec::with_capacity(attachments.len());
         for (name, bytes) in &attachments {
-            let hash = self.put_asset_tx(&mut tx, bytes).await?;
-            asset_hashes.push((name.clone(), hash));
+            let asset = self.put_asset_tx(&mut tx, name, bytes).await?;
+            asset_hashes.push((name.clone(), asset.asset_hash, asset.canonical_asset_hash));
+            asset_outcomes.push(asset.outcome);
+            on_asset_written();
         }
         self.set_pending_assets(&attachments).await;
         let result = async {
@@ -46,10 +72,13 @@ impl ChatStore {
                 self.insert_record_tx(&mut tx, &record).await?
             };
 
-            for (name, hash) in asset_hashes {
-                self.upsert_attachment_tx(&mut tx, record_id, &name, hash)
+            for (name, hash, canonical_hash) in asset_hashes {
+                self.upsert_attachment_tx(&mut tx, record_id, &name, hash, canonical_hash)
                     .await?;
             }
+
+            self.ensure_default_conversation_source_tx(&mut tx, &record)
+                .await?;
 
             tx.commit().await?;
             Ok::<_, anyhow::Error>((record_id, record))
@@ -59,15 +88,46 @@ impl ChatStore {
         let (record_id, mut record) = result?;
         record.id = Some(record_id);
         self.index_record(&record);
-        Ok(true)
+        Ok(WriteOutcome {
+            record_id,
+            record_inserted,
+            record_updated,
+            attachments_seen,
+            attachment_original_bytes,
+            assets: asset_outcomes,
+        })
     }
 
     async fn find_existing(&self, record: &Record) -> Result<Option<StoredRecord>> {
+        if let (Some(source_kind), Some(source_message_id)) =
+            (&record.source_kind, &record.source_message_id)
+        {
+            let source_match = sqlx::query_as::<_, StoredRecord>(
+                r#"
+                SELECT id, chat_type, owner_id, group_id, sender_id, sender_name, content, timestamp, metadata,
+                       source_kind, source_group_id, source_message_id, source_backup_id
+                FROM chat_records
+                WHERE chat_type = ?1 AND owner_id = ?2 AND source_kind = ?3 AND source_message_id = ?4
+                "#,
+            )
+            .bind(&record.chat_type)
+            .bind(&record.owner_id)
+            .bind(source_kind)
+            .bind(source_message_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if source_match.is_some() {
+                return Ok(source_match);
+            }
+        }
+
         Ok(sqlx::query_as::<_, StoredRecord>(
             r#"
-            SELECT id, chat_type, owner_id, group_id, sender_id, sender_name, content, timestamp, metadata
+            SELECT id, chat_type, owner_id, group_id, sender_id, sender_name, content, timestamp, metadata,
+                   source_kind, source_group_id, source_message_id, source_backup_id
             FROM chat_records
             WHERE chat_type = ?1 AND owner_id = ?2 AND group_id = ?3 AND sender_id = ?4 AND timestamp = ?5
+              AND source_message_id IS NULL
             "#,
         )
         .bind(&record.chat_type)
@@ -88,8 +148,9 @@ impl ChatStore {
         let result = sqlx::query(
             r#"
             INSERT INTO chat_records
-              (chat_type, owner_id, group_id, sender_id, sender_name, content, timestamp, metadata, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+              (chat_type, owner_id, group_id, sender_id, sender_name, content, timestamp, metadata,
+               source_kind, source_group_id, source_message_id, source_backup_id, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             "#,
         )
         .bind(&record.chat_type)
@@ -100,6 +161,10 @@ impl ChatStore {
         .bind(&record.content)
         .bind(record.timestamp)
         .bind(&record.metadata)
+        .bind(&record.source_kind)
+        .bind(&record.source_group_id)
+        .bind(&record.source_message_id)
+        .bind(&record.source_backup_id)
         .bind(now)
         .bind(now)
         .execute(&mut **tx)
@@ -116,13 +181,30 @@ impl ChatStore {
         let updated = sqlx::query(
             r#"
             UPDATE chat_records
-            SET sender_name = ?1, content = ?2, metadata = ?3, updated_at = ?4
-            WHERE id = ?5
+            SET group_id = ?1,
+                sender_id = ?2,
+                sender_name = ?3,
+                content = ?4,
+                timestamp = ?5,
+                metadata = ?6,
+                source_kind = ?7,
+                source_group_id = ?8,
+                source_message_id = ?9,
+                source_backup_id = ?10,
+                updated_at = ?11
+            WHERE id = ?12
             "#,
         )
+        .bind(&record.group_id)
+        .bind(&record.sender_id)
         .bind(&record.sender_name)
         .bind(&record.content)
+        .bind(record.timestamp)
         .bind(&record.metadata)
+        .bind(&record.source_kind)
+        .bind(&record.source_group_id)
+        .bind(&record.source_message_id)
+        .bind(&record.source_backup_id)
         .bind(Utc::now().timestamp())
         .bind(id)
         .execute(&mut **tx)
@@ -132,46 +214,30 @@ impl ChatStore {
         Ok(())
     }
 
-    pub(super) async fn put_asset_tx(
-        &self,
-        tx: &mut StoreWriteTx<'_>,
-        bytes: &[u8],
-    ) -> Result<Hash32> {
-        let hash = Hash32::sha3_256(bytes);
-        self.assets
-            .put_objects_batch_tx(
-                tx,
-                &[ObjectRecord {
-                    hash,
-                    kind: ObjectKind::Chunk,
-                    size: bytes.len() as u64,
-                    codec: Codec::Raw,
-                    content: bytes.to_vec(),
-                }],
-            )
-            .await?;
-        Ok(hash)
-    }
-
     pub(super) async fn upsert_attachment_tx(
         &self,
         tx: &mut StoreWriteTx<'_>,
         record_id: i64,
         name: &str,
         hash: Hash32,
+        canonical_hash: Hash32,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         sqlx::query(
             r#"
-            INSERT INTO chat_attachments (record_id, name, asset_hash, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO chat_attachments
+              (record_id, name, asset_hash, canonical_asset_hash, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(record_id, name) DO UPDATE
-            SET asset_hash = excluded.asset_hash, updated_at = excluded.updated_at
+            SET asset_hash = excluded.asset_hash,
+                canonical_asset_hash = excluded.canonical_asset_hash,
+                updated_at = excluded.updated_at
             "#,
         )
         .bind(record_id)
         .bind(name)
         .bind(hash.as_bytes().as_ref())
+        .bind(canonical_hash.as_bytes().as_ref())
         .bind(now)
         .bind(now)
         .execute(&mut **tx)

@@ -31,8 +31,8 @@ impl std::io::Write for OutFile {
         self.contents.flush()
     }
 
-    fn write_all(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
-        self.contents.write_all(&mut buf)
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.contents.write_all(buf)
     }
 
     fn write_fmt(&mut self, fmt: std::fmt::Arguments<'_>) -> std::io::Result<()> {

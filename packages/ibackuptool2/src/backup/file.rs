@@ -47,21 +47,22 @@ pub struct FileInfo {
 }
 
 impl FileInfo {
-    pub fn unwrap_encryption_key(&mut self, keybag: &KeyBag) {
+    pub fn unwrap_encryption_key(&mut self, keybag: &KeyBag) -> Result<(), BackupError> {
         // guard wrapped key
         let wrapped_encryption_key = match &self.wrapped_encryption_key {
             Some(el) => el,
-            _ => return,
+            _ => return Ok(()),
         };
 
         // guard class key
         let class_key = match keybag.find_class_key(&self.protection_class) {
             Some(class_key) => class_key,
-            _ => return,
+            _ => return Err(BackupError::NoClassKey),
         };
 
-        let result_key = unwrap_key(&class_key.as_slice(), wrapped_encryption_key);
+        let result_key = unwrap_key(class_key.as_slice(), wrapped_encryption_key)?;
         self.encryption_key = Some(result_key);
+        Ok(())
     }
 }
 
@@ -85,18 +86,16 @@ pub struct BackupFile {
 }
 
 impl BackupFile {
-    pub fn unwrap_file_key(&mut self, backup: &Backup) {
+    pub fn unwrap_file_key(&mut self, backup: &Backup) -> Result<(), BackupError> {
         let keybag = match backup.get_keybag() {
             Some(kb) => kb,
-            None => return,
+            None => return Ok(()),
         };
 
-        match self.fileinfo.as_mut() {
-            Some(fileinfo) => {
-                fileinfo.unwrap_encryption_key(keybag);
-            }
-            None => {}
+        if let Some(fileinfo) = self.fileinfo.as_mut() {
+            fileinfo.unwrap_encryption_key(keybag)?;
         }
+        Ok(())
     }
 }
 
@@ -106,13 +105,19 @@ impl TryFrom<::plist::Value> for FileInfo {
 
     fn try_from(value: ::plist::Value) -> Result<FileInfo, Self::Error> {
         // First, decode as an NSKeyedArchiver archive.
-        let fork = plist::decode_nskeyedarchiver(value);
+        let fork = plist::decode_nskeyedarchiver(value)?;
 
         if let Value::Dictionary(mut forkdict) = fork {
             // Unwrap contained binary data / attributes
             let val = forkdict.remove("EncryptionKey");
             if let Some(Value::Dictionary(dict)) = val {
                 if let Some(Value::Data(data)) = dict.get("NS.data") {
+                    if data.len() < 4 {
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "encryption key data is shorter than protection class prefix",
+                        )));
+                    }
                     let protclass = as_u32_le(&data[0..4]);
                     let mankey = &data[4..];
 
@@ -176,6 +181,9 @@ impl TryFrom<::plist::Value> for FileInfo {
             });
         }
 
-        unimplemented!()
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decoded file info is not a dictionary",
+        )))
     }
 }

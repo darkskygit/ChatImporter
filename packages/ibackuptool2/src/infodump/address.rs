@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 pub type Phone = String;
 pub type Email = String;
+type ListedProperty = (PropertyType, PropertyLabel, String);
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum PropertyType {
@@ -53,22 +54,15 @@ impl AddressBook {
             for phone in &person.phones {
                 let normalized = normalize_phone(&phone.1);
                 trace!("indexing: `{}` as `{}`", &phone.1, &normalized);
-                if index.contains_key(&normalized) {
-                    let x = index.get_mut(&normalized).unwrap();
-                    x.push(cell.clone());
-                } else {
-                    index.insert(normalized, vec![cell.clone()]);
-                }
+                index.entry(normalized).or_default().push(cell.clone());
             }
 
             for email in &person.emails {
                 trace!("indexing: `{}`", &email.1);
-                if index.contains_key(&email.1) {
-                    let x = index.get_mut(&email.1).unwrap();
-                    x.push(cell.clone());
-                } else {
-                    index.insert(email.1.to_string(), vec![cell.clone()]);
-                }
+                index
+                    .entry(email.1.to_string())
+                    .or_default()
+                    .push(cell.clone());
             }
         }
 
@@ -87,7 +81,7 @@ impl AddressBookIndexed {
 
         if self.index.contains_key(&normalized) {
             if let Some(res) = self.index.get(&normalized) {
-                if res.len() > 0 {
+                if !res.is_empty() {
                     return Some(res);
                 }
             }
@@ -98,7 +92,7 @@ impl AddressBookIndexed {
     pub fn raw_search(&self, query: &str) -> Option<&Vec<Box<Contact>>> {
         if self.index.contains_key(query) {
             if let Some(res) = self.index.get(query) {
-                if res.len() > 0 {
+                if !res.is_empty() {
                     return Some(res);
                 }
             }
@@ -267,7 +261,7 @@ fn normalize_phone(string: &str) -> String {
         .replace(")", "")
         .replace("-", "");
 
-    if string1.len() == 11 && string1.as_bytes()[0] == '1' as u8 {
+    if string1.len() == 11 && string1.as_bytes()[0] == b'1' {
         return string1.replacen("1", "", 1);
     }
 
@@ -281,7 +275,7 @@ pub fn heuristic_phone_same(a: &str, b: &str) -> bool {
 
 pub fn get_properties_of_type(
     kind: PropertyType,
-    inside: &Vec<(PropertyType, PropertyLabel, String)>,
+    inside: &[ListedProperty],
 ) -> Vec<(PropertyLabel, String)> {
     inside
         .iter()
@@ -314,16 +308,11 @@ pub fn load_address_book(conn: &Connection) -> Result<AddressBook, Box<dyn std::
     })?;
 
     let mut people: Vec<Contact> = vec![];
-    for contact in contact_iter {
-        match contact {
-            Ok(mut contact) => {
-                let props = find_listed_properties(conn, contact.rowid)?;
-                contact.emails = get_properties_of_type(PropertyType::Email, &props);
-                contact.phones = get_properties_of_type(PropertyType::Phone, &props);
-                people.push(contact);
-            }
-            Err(_) => {}
-        }
+    for mut contact in contact_iter.flatten() {
+        let props = find_listed_properties(conn, contact.rowid)?;
+        contact.emails = get_properties_of_type(PropertyType::Email, &props);
+        contact.phones = get_properties_of_type(PropertyType::Phone, &props);
+        people.push(contact);
     }
 
     Ok(AddressBook { people })
@@ -332,7 +321,7 @@ pub fn load_address_book(conn: &Connection) -> Result<AddressBook, Box<dyn std::
 pub fn find_listed_properties(
     conn: &Connection,
     record_id: u32,
-) -> Result<Vec<(PropertyType, PropertyLabel, String)>, Box<dyn std::error::Error>> {
+) -> Result<Vec<ListedProperty>, Box<dyn std::error::Error>> {
     let mut stmt = conn.prepare("SELECT ROWID, identifier, property, label, value, guid from ABMultiValue WHERE  record_id = $1")?;
 
     let value_iter = stmt.query_map([record_id], |row| {
@@ -350,7 +339,7 @@ pub fn find_listed_properties(
         ))
     })?;
 
-    Ok(value_iter.flat_map(|v| v).collect())
+    Ok(value_iter.flatten().collect())
 }
 
 #[cfg(test)]

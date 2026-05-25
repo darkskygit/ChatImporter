@@ -3,6 +3,7 @@ use log::{trace, warn};
 use ::crypto::buffer::{RefReadBuffer, RefWriteBuffer};
 
 use super::{pack_u64, unpack_64_bit};
+use crate::BackupError;
 
 /// perform aes_cbc_256
 pub fn decrypt_with_key(key: &Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
@@ -25,7 +26,7 @@ pub fn decrypt_with_key(key: &Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
     out
 }
 
-pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Vec<u8> {
+pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Result<Vec<u8>, BackupError> {
     trace!("Key: {:x?}", kek);
     trace!("Wrapped: {:x?}", wpky);
 
@@ -34,16 +35,19 @@ pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Vec<u8> {
 
     for i in 0..(wpky.len() / 8) {
         let slice: &[u8] = &wpky.as_slice()[i * 8..i * 8 + 8];
-        let val = unpack_64_bit(&slice);
+        let val = unpack_64_bit(slice);
 
         if let Some(val) = val {
             c.push(u64::from_be_bytes(val));
         } else {
-            panic!("Couldn't unwrap 64 bit value from provided wrapper.");
+            return Err(BackupError::InvalidKeybag);
         }
     }
 
     trace!("C: {:x?}", c);
+    if c.len() < 2 {
+        return Err(BackupError::InvalidKeybag);
+    }
 
     let n = c.len() - 1;
 
@@ -59,9 +63,7 @@ pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Vec<u8> {
     // for i in xrange(1,n+1):
     //     R[i] = C[i]
     // Copy c into r
-    for i in 1..(n + 1) {
-        r[i] = c[i]
-    }
+    r[1..(n + 1)].copy_from_slice(&c[1..(n + 1)]);
 
     trace!("key sz: {}", kek.len());
     trace!("c: {:?}", c);
@@ -72,7 +74,7 @@ pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Vec<u8> {
     for j in (0..6).rev() {
         for i in (1..n + 1).rev() {
             trace!("unwrapping key - it a={} n={} j={} i={}", a, n, j, i);
-            let val = (a as u64) ^ ((n as u64) * (j as u64) + (i as u64));
+            let val = a ^ ((n as u64) * (j as u64) + (i as u64));
             trace!("a component: {:x?}", val);
             trace!("r[i={}] component: {:x?}", i, r[i]);
             let mut packed = val.to_be_bytes().to_vec();
@@ -103,11 +105,18 @@ pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Vec<u8> {
 
                 let result = dec.decrypt(&mut input, &mut output, true);
                 trace!("is_Err: {}", result.is_err());
+                if result.is_err() {
+                    return Err(BackupError::InvalidKeybag);
+                }
                 trace!("res: {}", hex::encode(&out));
 
-                a = u64::from_be_bytes(unpack_64_bit(&out.as_slice()[0..8]).unwrap());
+                a = u64::from_be_bytes(
+                    unpack_64_bit(&out.as_slice()[0..8]).ok_or(BackupError::InvalidKeybag)?,
+                );
                 trace!("new a: {:x?}", a);
-                r[i] = u64::from_be_bytes(unpack_64_bit(&out.as_slice()[8..16]).unwrap());
+                r[i] = u64::from_be_bytes(
+                    unpack_64_bit(&out.as_slice()[8..16]).ok_or(BackupError::InvalidKeybag)?,
+                );
                 trace!("new r[{}]: {:x?}", i, a);
             }
         }
@@ -115,21 +124,21 @@ pub fn unwrap_key(kek: &[u8], wpky: &Vec<u8>) -> Vec<u8> {
 
     if a != 0xa6a6a6a6a6a6a6a6 {
         warn!("got iv: 0x{:x}, expected: 0xa6a6a6a6a6a6a6a6", a);
-        panic!("unexpected resulant iv. this is usually caused by an invalid password to the backup. If this occcurs midaway through an operation, please file an issue on the project issue tracker.");
+        return Err(BackupError::InvalidPassword);
     }
 
     let mut result: Vec<u8> = Vec::new();
     trace!("result vector {:x?}", r);
-    for i in 1..r.len() {
+    for (i, value) in r.iter().enumerate().skip(1) {
         // let packed =  Vec::new();
         // let other : Vec<u8> = packed..into();
-        let packed = pack_u64(r[i]);
-        trace!("r[i={}] = {:x} == {:x?}", i, r[i], &packed);
+        let packed = pack_u64(*value);
+        trace!("r[i={}] = {:x} == {:x?}", i, value, &packed);
 
         result.extend_from_slice(&packed);
     }
 
     trace!("decrypt result: {}", hex::encode(&result));
 
-    result
+    Ok(result)
 }

@@ -9,7 +9,7 @@ log = { version = "0.4.22", features = [
     "release_max_level_info",
 ] }
 regex = "1.11.1"
-rusqlite = "0.32.1"
+rusqlite = { version = "0.32.1", features = ["serialize"] }
 serde = { version = "1.0.214", features = ["derive"] }
 thiserror = "1.0.66"
 
