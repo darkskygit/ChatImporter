@@ -1477,6 +1477,59 @@ mod tests {
     }
 
     #[test]
+    fn ios_wechat_group_image_metadata_uses_stripped_xml_body() {
+        let backup_dir = tempdir().unwrap();
+        write_minimal_backup_metadata(backup_dir.path());
+        write_manifest_db(backup_dir.path(), Vec::new());
+        let mut backup = Backup::new(backup_dir.path()).unwrap();
+        backup.parse_manifest().unwrap();
+        let user_db = UserDB {
+            account: "account-a".into(),
+            wxid: "owner".into(),
+            name: "Owner".into(),
+            ..Default::default()
+        };
+        let contact = Contact {
+            name: "room@chatroom".into(),
+            remark: Some("Room".into()),
+            ..Default::default()
+        };
+        let record = user_db
+            .transform_record_line(
+                &backup,
+                &RecordLine {
+                    local_id: 8,
+                    server_id: 5073122080177807510,
+                    created_time: 1548479192,
+                    message: r#"wxid_sender:
+<?xml version="1.0"?>
+<msg><img aeskey="key-a" cdnmidimgurl="cdn-a" md5="md5-a" /></msg>"#
+                        .into(),
+                    status: 4,
+                    image_status: 2,
+                    msg_type: MsgType::Image,
+                    is_dest: true,
+                },
+                &contact,
+            )
+            .unwrap();
+        let record = record.get_record();
+        let metadata: IosWcMetadata = from_slice(record.metadata.as_ref().unwrap()).unwrap();
+
+        assert_eq!(record.content, "[img]");
+        assert_eq!(record.sender_id, "wxid_sender");
+        assert_eq!(metadata.raw.parse_error, None);
+        assert_eq!(
+            metadata.field("key"),
+            Some(&MetadataValue::Str("key-a".into()))
+        );
+        assert_eq!(
+            metadata.field("img_cdn"),
+            Some(&MetadataValue::Str("cdn-a".into()))
+        );
+    }
+
+    #[test]
     fn ios_wechat_truncated_xml_preserves_record_with_fallback_content() {
         let backup_dir = tempdir().unwrap();
         write_minimal_backup_metadata(backup_dir.path());

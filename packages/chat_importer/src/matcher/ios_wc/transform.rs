@@ -84,6 +84,11 @@ impl UserDB {
             }
         };
 
+        let content_line = RecordLine {
+            message: content.clone(),
+            ..line.clone()
+        };
+
         let (content, metadata, attach) = match line.msg_type {
             MsgType::Normal => Some((
                 content.replace("\u{2028}", " ").replace("\u{2029}", " "),
@@ -91,7 +96,7 @@ impl UserDB {
                 HashMap::new(),
             )),
             MsgType::Image => MediaResolver::image(
-                line,
+                &content_line,
                 backup,
                 &self.account_files,
                 &self.account,
@@ -107,12 +112,15 @@ impl UserDB {
             .or_else(|| {
                 Some((
                     "[img]".into(),
-                    Some(MediaResolver::image_metadata(line).with_type(line.msg_type.clone())),
+                    Some(
+                        MediaResolver::image_metadata(&content_line)
+                            .with_type(line.msg_type.clone()),
+                    ),
                     HashMap::new(),
                 ))
             }),
             MsgType::Video | MsgType::ShortVideo => MediaResolver::video(
-                line,
+                &content_line,
                 backup,
                 &self.account_files,
                 &self.account,
@@ -128,12 +136,15 @@ impl UserDB {
             .or_else(|| {
                 Some((
                     "[video]".into(),
-                    Some(MediaResolver::video_metadata(line).with_type(line.msg_type.clone())),
+                    Some(
+                        MediaResolver::video_metadata(&content_line)
+                            .with_type(line.msg_type.clone()),
+                    ),
                     HashMap::new(),
                 ))
             }),
             MsgType::Voice => MediaResolver::audio(
-                line,
+                &content_line,
                 backup,
                 &self.account_files,
                 &self.account,
@@ -149,33 +160,38 @@ impl UserDB {
             .or_else(|| {
                 Some((
                     "[voice]".into(),
-                    Some(MediaResolver::audio_metadata(line).with_type(line.msg_type.clone())),
+                    Some(
+                        MediaResolver::audio_metadata(&content_line)
+                            .with_type(line.msg_type.clone()),
+                    ),
                     HashMap::new(),
                 ))
             }),
             MsgType::BigEmoji => Some((
                 "[emoji]".into(),
-                Some(parse_emoji(line).with_type(line.msg_type.clone())),
+                Some(parse_emoji(&content_line).with_type(line.msg_type.clone())),
                 HashMap::new(),
             )),
             MsgType::ContactShare | MsgType::WeWorkContactShare => Some((
                 "[contact]".into(),
-                Some(parse_contact_share(line).with_type(line.msg_type.clone())),
+                Some(parse_contact_share(&content_line).with_type(line.msg_type.clone())),
                 HashMap::new(),
             )),
             MsgType::Location => Some((
                 "[location]".into(),
-                Some(parse_location(line).with_type(line.msg_type.clone())),
+                Some(parse_location(&content_line).with_type(line.msg_type.clone())),
                 HashMap::new(),
             )),
-            MsgType::CustomApp => {
-                MediaResolver::custom_app(line, backup, &self.account, &gen_md5(&contact.name)).map(
-                    |(metadata, map)| {
-                        let label = appmsg_label(&metadata);
-                        (label, Some(metadata.with_type(line.msg_type.clone())), map)
-                    },
-                )
-            }
+            MsgType::CustomApp => MediaResolver::custom_app(
+                &content_line,
+                backup,
+                &self.account,
+                &gen_md5(&contact.name),
+            )
+            .map(|(metadata, map)| {
+                let label = appmsg_label(&metadata);
+                (label, Some(metadata.with_type(line.msg_type.clone())), map)
+            }),
             MsgType::VoipContent => Some((
                 "[voip]".into(),
                 Some(
@@ -187,11 +203,12 @@ impl UserDB {
             )),
             MsgType::VoipStatus => Some((
                 "[voip]".into(),
-                Some(parse_voip_status(line).with_type(line.msg_type.clone())),
+                Some(parse_voip_status(&content_line).with_type(line.msg_type.clone())),
                 HashMap::new(),
             )),
             MsgType::System | MsgType::Revoke => {
-                let (label, metadata) = parse_system_message(&line.message, line.msg_type.clone());
+                let (label, metadata) =
+                    parse_system_message(&content_line.message, line.msg_type.clone());
                 Some((label, Some(metadata), HashMap::new()))
             }
             _ => None,
