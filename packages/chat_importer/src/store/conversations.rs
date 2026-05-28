@@ -184,6 +184,8 @@ impl ChatStore {
             ON CONFLICT(chat_type, owner_id, conversation_key) DO UPDATE
             SET display_name = COALESCE(excluded.display_name, chat_conversations.display_name),
                 updated_at = excluded.updated_at
+            WHERE excluded.display_name IS NOT NULL
+              AND chat_conversations.display_name IS NOT excluded.display_name
             "#,
         )
         .bind(chat_type)
@@ -229,6 +231,11 @@ impl ChatStore {
             SET conversation_id = excluded.conversation_id,
                 source_label = COALESCE(excluded.source_label, chat_conversation_sources.source_label),
                 updated_at = excluded.updated_at
+            WHERE chat_conversation_sources.conversation_id IS NOT excluded.conversation_id
+               OR (
+                    excluded.source_label IS NOT NULL
+                    AND chat_conversation_sources.source_label IS NOT excluded.source_label
+                  )
             "#,
         )
         .bind(conversation_id)

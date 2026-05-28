@@ -1,6 +1,7 @@
 mod assets;
 mod conversations;
 mod core;
+mod media;
 mod query;
 pub mod schema;
 pub mod types;
@@ -8,8 +9,9 @@ mod write;
 
 pub use core::ChatStore;
 pub use types::{
-    AssetWriteOutcome, Attachments, ConversationMergePreview, ConversationMergeRequest,
-    MetadataMerger, Query, Record, RecordDuplicateCandidate, RecordType, WriteOutcome,
+    AssetWriteOutcome, Attachment, Attachments, ConversationMergePreview, ConversationMergeRequest,
+    MetadataMergeContext, MetadataMerger, Query, Record, RecordDuplicateCandidate, RecordType,
+    WriteOutcome,
 };
 pub use write::PreparedRecord;
 
@@ -120,6 +122,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_record_upsert_does_not_touch_updated_at() {
+        let (_dir, mut store) = store().await;
+        let unchanged = record("same", 1);
+        store
+            .insert_or_update(RecordType::from(unchanged.clone()), None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE chat_records SET updated_at = 1")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        store
+            .insert_or_update(RecordType::from(unchanged), None)
+            .await
+            .unwrap();
+
+        let updated_at: i64 = sqlx::query_scalar("SELECT updated_at FROM chat_records")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(updated_at, 1);
+    }
+
+    #[tokio::test]
     async fn source_identity_updates_existing_record_when_legacy_key_changes() {
         let (_dir, mut store) = store().await;
         let mut first = record("first", 1);
@@ -155,6 +182,43 @@ mod tests {
             Some("source-group-b")
         );
         assert_eq!(records[0].source_backup_id.as_deref(), Some("backup-b"));
+    }
+
+    #[tokio::test]
+    async fn batch_insert_sees_records_inserted_earlier_in_same_transaction() {
+        let (_dir, mut store) = store().await;
+        let mut first = record("first", 1);
+        first.source_kind = Some("ios-sms".into());
+        first.source_group_id = Some("source-group-a".into());
+        first.source_message_id = Some("message-1".into());
+        first.source_backup_id = Some("backup-a".into());
+
+        let mut second = record("second", 99);
+        second.group_id = "source-group-b".into();
+        second.source_kind = Some("ios-sms".into());
+        second.source_group_id = Some("source-group-b".into());
+        second.source_message_id = Some("message-1".into());
+        second.source_backup_id = Some("backup-b".into());
+
+        let prepared = vec![
+            ChatStore::prepare_record(RecordType::from(first)).unwrap(),
+            ChatStore::prepare_record(RecordType::from(second)).unwrap(),
+        ];
+        let outcomes = store
+            .insert_or_update_prepared_batch_detailed(prepared, None, || {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].record_inserted);
+        assert!(outcomes[1].record_updated);
+        let records = store.query(Query::default()).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "second");
+        assert_eq!(
+            records[0].source_group_id.as_deref(),
+            Some("source-group-b")
+        );
     }
 
     #[tokio::test]
@@ -602,6 +666,7 @@ mod tests {
             &self,
             _store: &ChatStore,
             _new_attachments: &Attachments,
+            _context: &MetadataMergeContext,
             old_metadata: Vec<u8>,
             new_metadata: Vec<u8>,
         ) -> Option<Vec<u8>> {
@@ -619,6 +684,7 @@ mod tests {
             &self,
             store: &ChatStore,
             _new_attachments: &Attachments,
+            _context: &MetadataMergeContext,
             _old_metadata: Vec<u8>,
             _new_metadata: Vec<u8>,
         ) -> Option<Vec<u8>> {
@@ -688,7 +754,9 @@ mod tests {
             .insert_or_update(
                 RecordType::from((
                     updated,
-                    [("asset".into(), data.clone())].iter().cloned().collect(),
+                    vec![("asset".into(), Attachment::from_bytes(data.clone()))]
+                        .into_iter()
+                        .collect(),
                 )),
                 Some(&AssetVisibleMerger {
                     hash: Hash32::sha3_256(&data),
@@ -706,9 +774,11 @@ mod tests {
     async fn attachment_writes_are_deduped_and_readable() {
         let (_dir, mut store) = store().await;
         let data = b"same-data".to_vec();
-        let attachments =
-            IntoIterator::into_iter([("a".into(), data.clone()), ("b".into(), data.clone())])
-                .collect();
+        let attachments = IntoIterator::into_iter([
+            ("a".into(), Attachment::from_bytes(data.clone())),
+            ("b".into(), Attachment::from_bytes(data.clone())),
+        ])
+        .collect();
         store
             .insert_or_update(
                 RecordType::from((record("with assets", 1), attachments)),
@@ -767,7 +837,9 @@ mod tests {
             .insert_or_update(
                 RecordType::from((
                     record("with asset", 1),
-                    [("image".into(), first.clone())].iter().cloned().collect(),
+                    vec![("image".into(), Attachment::from_bytes(first.clone()))]
+                        .into_iter()
+                        .collect(),
                 )),
                 None,
             )
@@ -777,7 +849,9 @@ mod tests {
             .insert_or_update(
                 RecordType::from((
                     record("with replacement", 1),
-                    [("image".into(), second.clone())].iter().cloned().collect(),
+                    vec![("image".into(), Attachment::from_bytes(second.clone()))]
+                        .into_iter()
+                        .collect(),
                 )),
                 None,
             )

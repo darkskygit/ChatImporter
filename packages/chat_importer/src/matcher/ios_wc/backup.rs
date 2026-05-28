@@ -52,14 +52,11 @@ impl Extractor {
                     .map(|user_id| user_id.name_str().to_string())
                 {
                     if user_id == "MMappedKV" {
-                        user_id = if path.ext_str() == "crc" {
-                            gen_md5(path.with_extension("").ext_str())
+                        if let Some(wxid) = mmsetting_archive_wxid(path.name_str()) {
+                            user_id = gen_md5(wxid);
                         } else {
-                            gen_md5(path.ext_str())
-                        };
-                        if user_id == "d41d8cd98f00b204e9800998ecf8427e" {
                             continue;
-                        }
+                        };
                     }
                     if let Some(user) = user_map.remove(&user_id) {
                         let user: UserDB = user;
@@ -104,5 +101,14 @@ impl Extractor {
 
     pub fn get_user_db(&self, user: &str) -> Option<(&UserDB, &Backup)> {
         self.user_info.get(user).map(|db| (db, &self.backup))
+    }
+}
+
+pub(super) fn mmsetting_archive_wxid(filename: &str) -> Option<&str> {
+    let wxid = filename.strip_prefix("mmsetting.archive.")?;
+    if wxid.is_empty() || wxid.ends_with(".crc") {
+        None
+    } else {
+        Some(wxid)
     }
 }

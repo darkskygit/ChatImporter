@@ -329,7 +329,9 @@ impl Extractor {
                             msg.images
                                 .iter()
                                 .filter_map(|image| match image.clone() {
-                                    QQMsgImage::Attach { data, name } => Some((name, data)),
+                                    QQMsgImage::Attach { data, name } => {
+                                        Some((name, Attachment::from_bytes(data)))
+                                    }
                                     _ => None,
                                 })
                                 .collect(),
@@ -436,10 +438,7 @@ impl MsgMatcher for Extractor {
             })
             .context("Cannot transform QQ records")?;
         progress.chat_parsed(records.len() as u64, record_blob_count(&records) as u64);
-        Ok(vec![RecordBatch {
-            label: self.file_name.clone(),
-            records,
-        }])
+        Ok(vec![RecordBatch { records }])
     }
 }
 
@@ -566,7 +565,7 @@ mod tests {
         assert!(metadata.contains(&Hash32::sha3_256(b"qq-image").to_hex()));
         match &records[0] {
             RecordType::RecordWithAttachments { attachments, .. } => {
-                assert_eq!(attachments.get("pic.png").unwrap(), b"qq-image");
+                assert_eq!(attachments.get("pic.png").unwrap().bytes(), b"qq-image");
             }
             _ => panic!("expected attachment record"),
         }
@@ -583,7 +582,7 @@ mod tests {
         assert_eq!(stored[0].content, "hello<img>");
         match &records[0] {
             RecordType::RecordWithAttachments { attachments, .. } => {
-                let hash = Hash32::sha3_256(attachments.get("pic.png").unwrap());
+                let hash = Hash32::sha3_256(attachments.get("pic.png").unwrap().bytes());
                 assert_eq!(
                     store.get_asset(hash).await.unwrap().unwrap(),
                     b"qq-image".to_vec()

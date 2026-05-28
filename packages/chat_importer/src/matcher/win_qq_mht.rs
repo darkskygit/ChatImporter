@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(record.content, "hello<img>");
         match &records[0] {
             RecordType::RecordWithAttachments { attachments, .. } => {
-                assert_eq!(attachments.get("pic.png").unwrap(), b"qq-image");
+                assert_eq!(attachments.get("pic.png").unwrap().bytes(), b"qq-image");
             }
             _ => panic!("expected attachment record"),
         }

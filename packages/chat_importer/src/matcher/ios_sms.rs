@@ -301,10 +301,7 @@ impl MsgMatcher for Extractor {
                             .collect::<Vec<_>>();
                         progress
                             .chat_parsed(records.len() as u64, record_blob_count(&records) as u64);
-                        RecordBatch {
-                            label: conversation.rowid.to_string(),
-                            records,
-                        }
+                        RecordBatch { records }
                     })
             })
             .collect())

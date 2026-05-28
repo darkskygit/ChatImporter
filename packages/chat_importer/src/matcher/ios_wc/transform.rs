@@ -1,6 +1,8 @@
 use super::account::UserDB;
 use super::appmsg::appmsg_label;
-use super::basic::{parse_contact_share, parse_emoji, parse_location, parse_voip_status};
+use super::basic::{
+    parse_contact_share, parse_emoji, parse_location, parse_msg_source, parse_voip_status,
+};
 use super::contact::*;
 use super::media::MediaResolver;
 use super::message::{MsgType, RecordLine};
@@ -172,11 +174,13 @@ impl UserDB {
                 Some(parse_emoji(&content_line).with_type(line.msg_type.clone())),
                 HashMap::new(),
             )),
-            MsgType::ContactShare | MsgType::WeWorkContactShare => Some((
-                "[contact]".into(),
-                Some(parse_contact_share(&content_line).with_type(line.msg_type.clone())),
-                HashMap::new(),
-            )),
+            MsgType::ContactShare | MsgType::WeWorkContactShare | MsgType::OpenIMContactShare => {
+                Some((
+                    "[contact]".into(),
+                    Some(parse_contact_share(&content_line).with_type(line.msg_type.clone())),
+                    HashMap::new(),
+                ))
+            }
             MsgType::Location => Some((
                 "[location]".into(),
                 Some(parse_location(&content_line).with_type(line.msg_type.clone())),
@@ -214,6 +218,15 @@ impl UserDB {
             _ => None,
         }
         .unwrap_or_else(|| (content, None, HashMap::new()));
+        let metadata = if let Some(msg_source) = line.msg_source.as_deref() {
+            let source_metadata = parse_msg_source(msg_source).with_type(line.msg_type.clone());
+            Some(match metadata {
+                Some(metadata) => metadata.merge_fields_from(source_metadata),
+                None => source_metadata,
+            })
+        } else {
+            metadata
+        };
 
         let source_message_id = Self::source_message_id(contact, line, &content, &attach);
         let record = Record {
@@ -275,5 +288,60 @@ impl UserDB {
                 };
                 ret
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::contact::Contact;
+    use super::super::message::{MsgType, RecordLine};
+    use super::*;
+
+    #[test]
+    fn second_create_time_is_converted_to_millis() {
+        let timestamp = UserDB::create_time_timestamp_millis(1_598_219_157, 42);
+
+        assert!((1_598_219_157_000..1_598_219_158_000).contains(&timestamp));
+    }
+
+    #[test]
+    fn millisecond_create_time_is_not_multiplied_again() {
+        assert_eq!(
+            UserDB::create_time_timestamp_millis(1_598_219_157_438, 42),
+            1_598_219_157_438
+        );
+    }
+
+    #[test]
+    fn source_message_id_fallback_includes_local_facts() {
+        let contact = Contact {
+            name: "chat-a".into(),
+            ..Default::default()
+        };
+        let line = RecordLine {
+            local_id: 7,
+            server_id: 0,
+            created_time: 1_598_219_157,
+            message: "fallback".into(),
+            status: 0,
+            image_status: 0,
+            msg_type: MsgType::Normal,
+            is_dest: false,
+            msg_source: None,
+        };
+        let first = UserDB::source_message_id(&contact, &line, "fallback", &HashMap::new());
+        let second = UserDB::source_message_id(&contact, &line, "changed", &HashMap::new());
+        let with_attachment = UserDB::source_message_id(
+            &contact,
+            &line,
+            "fallback",
+            &vec![("asset".into(), Attachment::from_bytes(b"bytes".to_vec()))]
+                .into_iter()
+                .collect(),
+        );
+
+        assert!(first.starts_with("fallback:chat-a:1598219157:7:"));
+        assert_ne!(first, second);
+        assert_ne!(first, with_attachment);
     }
 }

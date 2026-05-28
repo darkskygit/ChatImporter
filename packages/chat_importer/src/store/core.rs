@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Result;
 use assetpack_core::{Hash32, SqliteStore};
 use memory_indexer::InMemoryIndex;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
@@ -68,7 +68,10 @@ impl ChatStore {
                 SqliteConnectOptions::new()
                     .filename(path)
                     .create_if_missing(true)
-                    .foreign_keys(true),
+                    .foreign_keys(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Normal)
+                    .pragma("wal_autocheckpoint", "0"),
             )
             .await?;
         sqlx::query("PRAGMA foreign_keys = ON")
@@ -86,6 +89,13 @@ impl ChatStore {
         };
         store.rebuild_index().await?;
         Ok(store)
+    }
+
+    pub async fn checkpoint_wal(&self) -> Result<()> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub(super) async fn set_pending_assets(&self, assets: &[(Hash32, Vec<u8>)]) {

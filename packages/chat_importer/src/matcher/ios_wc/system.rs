@@ -5,14 +5,22 @@ use serde_json::json;
 
 pub(super) fn system_label(metadata: &IosWcMetadata) -> String {
     metadata
-        .field_str("system_type")
-        .map(|kind| format!("[system:{}]", kind))
+        .system
+        .as_ref()
+        .and_then(|system| system["system_type"].as_str())
+        .or_else(|| metadata.field_str("system_type"))
+        .map(|kind| format!("[system:{kind}]"))
         .unwrap_or_else(|| "[system]".into())
 }
 
 pub(super) fn parse_system_message(message: &str, msg_type: MsgType) -> (String, IosWcMetadata) {
-    let mut metadata = if message.trim_start().starts_with('<') && SafeXml::parse(message).is_err()
-    {
+    let trimmed = message.trim_start();
+    let expects_xml_document = trimmed.starts_with("<sysmsg")
+        || trimmed.starts_with("<msg")
+        || trimmed.starts_with("<revokecontent")
+        || trimmed.starts_with("<?xml")
+        || trimmed.starts_with("<!DOCTYPE");
+    let mut metadata = if expects_xml_document && SafeXml::parse(message).is_err() {
         let error = if msg_type == MsgType::Revoke {
             "invalid revoke xml"
         } else {
@@ -75,6 +83,7 @@ pub(super) fn parse_system_message(message: &str, msg_type: MsgType) -> (String,
         "system_type": system_type,
         "content": parsed_text,
     }));
+    metadata = metadata.without_fields(&["system_type", "content"]);
 
     let label = if msg_type == MsgType::Revoke {
         "[revoke]".into()
@@ -82,4 +91,92 @@ pub(super) fn parse_system_message(message: &str, msg_type: MsgType) -> (String,
         system_label(&metadata)
     };
     (label, metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_success_classifications_have_metadata() {
+        let cases = [
+            (
+                "<sysmsg><sysmsgtemplate><content_template><template>invited</template></content_template></sysmsgtemplate></sysmsg>",
+                "sysmsgtemplate",
+                "invited",
+            ),
+            (
+                "<sysmsg><editrevokecontent>edited</editrevokecontent></sysmsg>",
+                "editrevokecontent",
+                "edited",
+            ),
+            (
+                "<sysmsg type=\"paymsg\"><paymsg><template>paid</template></paymsg></sysmsg>",
+                "paymsg",
+                "paid",
+            ),
+            ("Alice 邀请 Bob 加入了群聊", "room_join", "Alice 邀请 Bob 加入了群聊"),
+            ("Alice 退出了群聊", "room_leave", "Alice 退出了群聊"),
+            ("Alice 修改群名为 Project", "room_rename", "Alice 修改群名为 Project"),
+            ("群公告 updated", "room_announcement", "群公告 updated"),
+            ("Alice 拍了拍 Bob", "pat", "Alice 拍了拍 Bob"),
+            ("Alice 领取了红包", "red_packet", "Alice 领取了红包"),
+        ];
+
+        for (message, system_type, content) in cases {
+            let (label, metadata) = parse_system_message(message, MsgType::System);
+            assert_eq!(label, format!("[system:{}]", system_type));
+            assert_eq!(metadata.field("system_type"), None);
+            assert_eq!(metadata.field("content"), None);
+            assert_eq!(
+                metadata.system.as_ref().unwrap()["system_type"],
+                system_type
+            );
+            assert_eq!(
+                metadata.system.as_ref().unwrap()["content"],
+                serde_json::json!(content)
+            );
+        }
+    }
+
+    #[test]
+    fn system_parser_fallback_preserves_text() {
+        let (label, metadata) =
+            parse_system_message("<sysmsg><paymsg><template>paid</template>", MsgType::System);
+
+        assert_eq!(label, "[system:plain]");
+        assert_eq!(
+            metadata.raw.parse_error.as_deref(),
+            Some("invalid system xml")
+        );
+        assert_eq!(metadata.field("content"), None);
+        assert_eq!(
+            metadata.system.as_ref().unwrap()["content"],
+            serde_json::json!("<sysmsg><paymsg><template>paid</template>")
+        );
+    }
+
+    #[test]
+    fn system_rich_text_fragment_is_not_invalid_xml() {
+        let (_, metadata) = parse_system_message(
+            r#"<img src="SystemMessages_HongbaoIcon.png"/> Alice领取了<_wc_custom_link_ href="weixin://weixinhongbao/opendetail">红包</_wc_custom_link_>"#,
+            MsgType::System,
+        );
+
+        assert_eq!(metadata.raw.parse_error.as_deref(), None);
+        assert_eq!(
+            metadata.system.as_ref().unwrap()["system_type"],
+            serde_json::json!("red_packet")
+        );
+    }
+
+    #[test]
+    fn invalid_revoke_xml_records_parse_error() {
+        let (_, metadata) = parse_system_message("<!DOCTYPE msg><msg />", MsgType::Revoke);
+
+        assert_eq!(
+            metadata.raw.parse_error.as_deref(),
+            Some("invalid revoke xml")
+        );
+    }
 }

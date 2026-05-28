@@ -1,5 +1,5 @@
 use super::message::RecordLine;
-use super::xml::{xml_attr, SafeXml};
+use super::xml::{xml_attr, xml_text, SafeXml};
 use super::*;
 
 fn xml_metadata(message: &str, error: &'static str) -> IosWcMetadata {
@@ -67,6 +67,22 @@ pub(super) fn parse_location(line: &RecordLine) -> IosWcMetadata {
     )
 }
 
+pub(super) fn parse_msg_source(source: &str) -> IosWcMetadata {
+    [
+        xml_text(source, &["msgsource", "sequence_id"]).map(|v| ("msgsource_sequence_id", v)),
+        xml_text(source, &["msgsource", "strid"]).map(|v| ("msgsource_strid", v)),
+        xml_text(source, &["msgsource", "silence"]).map(|v| ("msgsource_silence", v)),
+        xml_text(source, &["msgsource", "membercount"]).map(|v| ("msgsource_membercount", v)),
+        xml_text(source, &["msgsource", "signature"]).map(|v| ("msgsource_signature", v)),
+    ]
+    .iter()
+    .filter_map(|e| e.as_ref())
+    .fold(
+        xml_metadata(source, "invalid msgsource xml"),
+        |metadata, (k, v)| metadata.with_tag(k.to_string(), v.into()),
+    )
+}
+
 pub(super) fn parse_voip_status(line: &RecordLine) -> IosWcMetadata {
     [xml_attr(&line.message, &["msg"], "msgContent").map(|v| ("content", v))]
         .iter()
@@ -75,4 +91,42 @@ pub(super) fn parse_voip_status(line: &RecordLine) -> IosWcMetadata {
             xml_metadata(&line.message, "invalid voip xml"),
             |metadata, (k, v)| metadata.with_tag(k.to_string(), v.into()),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::message::MsgType;
+    use super::*;
+
+    fn line(message: &str, msg_type: MsgType) -> RecordLine {
+        RecordLine {
+            local_id: 1,
+            server_id: 1,
+            created_time: 1,
+            message: message.into(),
+            status: 0,
+            image_status: 0,
+            msg_type,
+            is_dest: false,
+            msg_source: None,
+        }
+    }
+
+    #[test]
+    fn invalid_contact_and_location_xml_records_parse_error() {
+        let invalid = "<!DOCTYPE msg><msg />";
+        let contact_metadata = parse_contact_share(&line(invalid, MsgType::ContactShare))
+            .with_type(MsgType::ContactShare);
+        let location_metadata =
+            parse_location(&line(invalid, MsgType::Location)).with_type(MsgType::Location);
+
+        assert_eq!(
+            contact_metadata.raw.parse_error.as_deref(),
+            Some("invalid contact xml")
+        );
+        assert_eq!(
+            location_metadata.raw.parse_error.as_deref(),
+            Some("invalid location xml")
+        );
+    }
 }

@@ -1,5 +1,5 @@
 use super::contact::*;
-use super::message::load_record_lines;
+use super::message::{load_record_line_chunks, RecordLine};
 use super::mmap::{MMMap, MMType};
 use super::session::SessionIndex;
 use super::*;
@@ -19,6 +19,13 @@ pub(super) struct UserDB {
     pub(super) wxid: String,
     pub(super) name: String,
     pub(super) head: String,
+}
+
+#[derive(Clone)]
+pub(super) struct ChatSelection {
+    pub(super) selector: String,
+    pub(super) chat_id: String,
+    pub(super) contact: Contact,
 }
 
 impl UserDB {
@@ -75,7 +82,7 @@ impl UserDB {
             }
         } else if filename == "mmsetting.archive" {
             self.setting = Some(file.clone());
-        } else if filename.starts_with("mmsetting.archive.") {
+        } else if super::backup::mmsetting_archive_wxid(&filename).is_some() {
             self.kv_setting = Some(file.clone())
         }
         self
@@ -180,8 +187,15 @@ impl UserDB {
         if let Some(setting) = &self.kv_setting {
             let data = backup.read_file(setting)?;
             let map = MMMap::to_map(&data, None);
+            let path = Path::new(&setting.relative_filename);
+            let filename = path.name_str();
             self.wxid = if self.wxid.is_empty() {
-                map.get("86").map(MMType::as_str).unwrap_or_default().into()
+                map.get("86")
+                    .map(MMType::as_str)
+                    .filter(|wxid| !wxid.is_empty())
+                    .or_else(|| super::backup::mmsetting_archive_wxid(filename))
+                    .unwrap_or_default()
+                    .into()
             } else {
                 self.wxid.clone()
             };
@@ -252,7 +266,9 @@ impl UserDB {
     }
 
     fn get_chat_ids(&self) -> Vec<String> {
-        self.chats.keys().cloned().collect::<Vec<_>>()
+        let mut chats = self.chats.keys().cloned().collect::<Vec<_>>();
+        chats.sort();
+        chats
     }
 
     fn get_contacts(&self) -> Vec<String> {
@@ -357,22 +373,17 @@ impl UserDB {
         contacts
     }
 
-    fn load_records<S: ToString>(&self, backup: &Backup, chat_id: S) -> Option<Vec<RecordType>> {
-        let chat_id = chat_id.to_string();
-        let contact = self.contacts.get(&chat_id).cloned().unwrap_or_else(|| {
+    fn chat_contact(&self, chat_id: &str) -> Contact {
+        self.contacts.get(chat_id).cloned().unwrap_or_else(|| {
             warn!(
                 "chat contact missing, preserving source chat id: {}",
                 chat_id
             );
             Contact {
-                name: chat_id.clone(),
+                name: chat_id.into(),
                 ..Default::default()
             }
-        });
-        load_record_lines(&self.messages, &self.chats, &chat_id)
-            .map(|lines| self.transform_record_lines(backup, &contact, lines))
-            .map_err(|e| warn!("failed to get chat line: {}", e))
-            .ok()
+        })
     }
 
     pub fn get_record_names(&self, names: Option<Vec<String>>) -> Vec<String> {
@@ -383,7 +394,14 @@ impl UserDB {
         }
     }
 
-    pub fn get_records(&self, backup: &Backup, name: String) -> Vec<RecordType> {
+    pub(super) fn get_record_chats(&self, names: Option<Vec<String>>) -> Vec<ChatSelection> {
+        self.get_record_names(names)
+            .into_iter()
+            .flat_map(|name| self.resolve_record_chats(name))
+            .collect()
+    }
+
+    fn resolve_record_chats(&self, name: String) -> Vec<ChatSelection> {
         let mut contacts = self.find_contacts(&name);
         if contacts.is_empty() && self.chats.contains_key(&name) {
             contacts.push(name.clone());
@@ -405,12 +423,27 @@ impl UserDB {
             }
         }
         contacts
-            .iter()
-            .filter_map(|chat_id| {
-                info!("Extracting: {} => {}", name, chat_id);
-                self.load_records(backup, chat_id)
+            .into_iter()
+            .map(|chat_id| {
+                let contact = self.chat_contact(&chat_id);
+                ChatSelection {
+                    selector: name.clone(),
+                    chat_id,
+                    contact,
+                }
             })
-            .flatten()
-            .collect::<Vec<_>>()
+            .collect()
+    }
+
+    pub(super) fn load_record_line_chunks<F>(
+        &self,
+        chat_id: &str,
+        chunk_size: usize,
+        emit: F,
+    ) -> SqliteResult<usize>
+    where
+        F: FnMut(usize, Vec<RecordLine>),
+    {
+        load_record_line_chunks(&self.messages, &self.chats, chat_id, chunk_size, emit)
     }
 }

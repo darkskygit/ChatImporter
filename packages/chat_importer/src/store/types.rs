@@ -3,7 +3,59 @@ use std::collections::HashMap;
 
 use super::ChatStore;
 
-pub type Attachments = HashMap<String, Vec<u8>>;
+pub type Attachments = HashMap<String, Attachment>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Attachment {
+    bytes: Vec<u8>,
+    analysis_bytes: Option<Vec<u8>>,
+    modified_at: Option<u64>,
+}
+
+impl Attachment {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            analysis_bytes: None,
+            modified_at: None,
+        }
+    }
+
+    pub fn with_analysis_bytes(bytes: Vec<u8>, analysis_bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            analysis_bytes: Some(analysis_bytes),
+            modified_at: None,
+        }
+    }
+
+    pub fn with_modified_at(mut self, modified_at: Option<u64>) -> Self {
+        self.modified_at = modified_at;
+        self
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn analysis_bytes(&self) -> Option<&[u8]> {
+        self.analysis_bytes.as_deref()
+    }
+
+    pub fn modified_at(&self) -> Option<u64> {
+        self.modified_at
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl From<Vec<u8>> for Attachment {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, sqlx::FromRow)]
 pub struct Record {
@@ -162,12 +214,19 @@ pub struct WriteOutcome {
     pub assets: Vec<AssetWriteOutcome>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetadataMergeContext {
+    pub old_conversation_latest_timestamp: Option<i64>,
+    pub new_conversation_latest_timestamp: Option<i64>,
+}
+
 #[async_trait]
 pub trait MetadataMerger: Send + Sync {
     async fn merge(
         &self,
         store: &ChatStore,
         new_attachments: &Attachments,
+        context: &MetadataMergeContext,
         old_metadata: Vec<u8>,
         new_metadata: Vec<u8>,
     ) -> Option<Vec<u8>>;

@@ -42,7 +42,7 @@ pub(super) fn appmsg_kind(type_value: Option<&str>) -> AppMsgKind {
         Some(19) => AppMsgKind::ForwardedRecords,
         Some(24) => AppMsgKind::Note,
         Some(33 | 36 | 44) => AppMsgKind::MiniProgram,
-        Some(50 | 51) => AppMsgKind::Channels,
+        Some(50 | 51 | 63) => AppMsgKind::Channels,
         Some(57) => AppMsgKind::Refer,
         Some(62) => AppMsgKind::Pat,
         Some(2000) => AppMsgKind::Transfer,
@@ -105,6 +105,7 @@ pub(super) fn parse_appmsg_metadata(message: &str) -> IosWcMetadata {
         )
         .map(|v| ("receiver", v)),
         xml_text(message, &["msg", "appmsg", "finderFeed", "nickname"])
+            .or_else(|| xml_text(message, &["msg", "appmsg", "finderLive", "nickname"]))
             .map(|v| ("channels_nickname", v)),
         xml_text(message, &["msg", "appmsg", "weappinfo", "username"])
             .map(|v| ("mini_program_username", v)),
@@ -120,6 +121,9 @@ pub(super) fn parse_appmsg_metadata(message: &str) -> IosWcMetadata {
     let kind = appmsg_kind(metadata.field_str("appmsg_type"));
     let forwarded = parse_forwarded_records(message);
     let title = metadata.field_str("title").unwrap_or_default().to_string();
+    if base_parse_failed_but_recovered(&metadata, forwarded.is_empty()) {
+        metadata = metadata.without_parse_error();
+    }
     metadata.app = Some(json!({
         "kind": kind.as_str(),
         "title": title,
@@ -127,10 +131,16 @@ pub(super) fn parse_appmsg_metadata(message: &str) -> IosWcMetadata {
         "url": metadata.field_str("url"),
         "forwarded": forwarded,
     }));
+    metadata = metadata.without_fields(&["title", "description", "url", "appmsg_type"]);
     if matches!(kind, AppMsgKind::Unknown(_)) {
         metadata = metadata.with_raw_hash(message).with_summary(title);
     }
     metadata
+}
+
+fn base_parse_failed_but_recovered(metadata: &IosWcMetadata, forwarded_empty: bool) -> bool {
+    metadata.raw.parse_error.as_deref() == Some("invalid appmsg xml")
+        && (!metadata.fields.is_empty() || !forwarded_empty)
 }
 
 fn parse_forwarded_records(message: &str) -> Vec<ForwardedRecord> {
@@ -164,13 +174,23 @@ fn parse_forwarded_records(message: &str) -> Vec<ForwardedRecord> {
 
 pub(super) fn appmsg_label(metadata: &IosWcMetadata) -> String {
     let title = metadata
-        .field("title")
-        .and_then(|value| match value {
-            MetadataValue::Str(value) if !value.is_empty() => Some(value.as_str()),
-            _ => None,
+        .app
+        .as_ref()
+        .and_then(|app| app["title"].as_str())
+        .filter(|title| !title.is_empty())
+        .or_else(|| {
+            metadata.field("title").and_then(|value| match value {
+                MetadataValue::Str(value) if !value.is_empty() => Some(value.as_str()),
+                _ => None,
+            })
         })
         .unwrap_or("appmsg");
-    let kind = appmsg_kind(metadata.field_str("appmsg_type"));
+    let kind = metadata
+        .app
+        .as_ref()
+        .and_then(|app| app["kind"].as_str())
+        .map(appmsg_kind_from_str)
+        .unwrap_or_else(|| appmsg_kind(metadata.field_str("appmsg_type")));
     match kind {
         AppMsgKind::Link => format!("[link] {}", title),
         AppMsgKind::File => format!("[file] {}", title),
@@ -185,5 +205,155 @@ pub(super) fn appmsg_label(metadata: &IosWcMetadata) -> String {
         AppMsgKind::Refer => format!("[refer] {}", title),
         AppMsgKind::Pat => format!("[pat] {}", title),
         _ => format!("[appmsg] {}", title),
+    }
+}
+
+fn appmsg_kind_from_str(kind: &str) -> AppMsgKind {
+    match kind {
+        "text" => AppMsgKind::Text,
+        "image" => AppMsgKind::Image,
+        "audio" => AppMsgKind::Audio,
+        "video" => AppMsgKind::Video,
+        "link" => AppMsgKind::Link,
+        "file" => AppMsgKind::File,
+        "realtime_location" => AppMsgKind::RealtimeLocation,
+        "forwarded_records" => AppMsgKind::ForwardedRecords,
+        "note" => AppMsgKind::Note,
+        "mini_program" => AppMsgKind::MiniProgram,
+        "channels" => AppMsgKind::Channels,
+        "refer" => AppMsgKind::Refer,
+        "pat" => AppMsgKind::Pat,
+        "transfer" => AppMsgKind::Transfer,
+        "red_packet" => AppMsgKind::RedPacket,
+        "reader" => AppMsgKind::Reader,
+        value if value.starts_with("unknown:") => value
+            .trim_start_matches("unknown:")
+            .parse()
+            .map(AppMsgKind::Unknown)
+            .unwrap_or(AppMsgKind::Unknown(0)),
+        _ => AppMsgKind::Unknown(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::message::MsgType;
+    use super::super::metadata::MetadataValue;
+    use super::*;
+
+    #[test]
+    fn appmsg_subtypes_emit_structured_metadata() {
+        let cases = [
+            (
+                "file",
+                r#"<msg><appmsg><title>report.pdf</title><type>6</type><fileext>pdf</fileext><totallen>42</totallen></appmsg></msg>"#,
+                "[file] report.pdf",
+                "fileext",
+                "pdf",
+            ),
+            (
+                "refer",
+                r#"<msg><appmsg><title>reply</title><type>57</type><refermsg><displayname>Alice</displayname><content>hello</content></refermsg></appmsg></msg>"#,
+                "[refer] reply",
+                "refer_display_name",
+                "Alice",
+            ),
+            (
+                "transfer",
+                r#"<msg><appmsg><title>transfer</title><type>2000</type><wcpayinfo><feedesc>$1.00</feedesc><pay_memo>memo</pay_memo></wcpayinfo></appmsg></msg>"#,
+                "[transfer] transfer",
+                "feedesc",
+                "$1.00",
+            ),
+            (
+                "red_packet",
+                r#"<msg><appmsg><title>packet</title><type>2001</type></appmsg></msg>"#,
+                "[red packet] packet",
+                "title",
+                "packet",
+            ),
+            (
+                "mini_program",
+                r#"<msg><appmsg><title>mini</title><type>33</type><weappinfo><username>gh_x</username></weappinfo></appmsg></msg>"#,
+                "[mini program] mini",
+                "mini_program_username",
+                "gh_x",
+            ),
+            (
+                "channels",
+                r#"<msg><appmsg><title>live</title><type>63</type><finderLive><nickname>host</nickname></finderLive></appmsg></msg>"#,
+                "[channels] live",
+                "channels_nickname",
+                "host",
+            ),
+        ];
+
+        for (kind, xml, label, field, value) in cases {
+            let metadata = parse_appmsg_metadata(xml).with_type(MsgType::CustomApp);
+            assert_eq!(appmsg_label(&metadata), label);
+            assert_eq!(metadata.app.as_ref().unwrap()["kind"], kind);
+            if field == "title" {
+                assert_eq!(
+                    metadata.app.as_ref().unwrap()["title"],
+                    serde_json::json!(value)
+                );
+            } else {
+                assert_eq!(
+                    metadata.field(field),
+                    Some(&MetadataValue::Str(value.into()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn appmsg_declared_subtypes_are_not_unknown() {
+        let cases = [
+            (1, "text", "[appmsg] item"),
+            (2, "image", "[appmsg] item"),
+            (3, "audio", "[appmsg] item"),
+            (4, "video", "[appmsg] item"),
+            (7, "text", "[appmsg] item"),
+            (8, "video", "[appmsg] item"),
+            (17, "realtime_location", "[realtime location] item"),
+            (24, "note", "[note] item"),
+            (50, "channels", "[channels] item"),
+            (51, "channels", "[channels] item"),
+            (63, "channels", "[channels] item"),
+            (62, "pat", "[pat] item"),
+            (100001, "reader", "[reader] item"),
+        ];
+
+        for (appmsg_type, kind, label) in cases {
+            let metadata = parse_appmsg_metadata(&format!(
+                "<msg><appmsg><title>item</title><type>{}</type></appmsg></msg>",
+                appmsg_type
+            ));
+            assert_eq!(metadata.app.as_ref().unwrap()["kind"], kind);
+            assert_eq!(appmsg_label(&metadata), label);
+            assert!(metadata.raw.raw_hash.is_none());
+        }
+    }
+
+    #[test]
+    fn forwarded_and_unknown_appmsg_metadata() {
+        let forwarded_xml = r#"<record><dataitem><datatitle>First</datatitle><sourcename>Alice</sourcename><datadesc>Hello</datadesc></dataitem></record>"#;
+        let metadata = parse_appmsg_metadata(&format!(
+            "<msg><appmsg><title>history</title><type>19</type><recorditem>{}</recorditem></appmsg></msg>",
+            htmlescape::encode_minimal(forwarded_xml)
+        ));
+        let forwarded = metadata.app.as_ref().unwrap()["forwarded"]
+            .as_array()
+            .unwrap();
+        assert_eq!(appmsg_label(&metadata), "[forwarded] history");
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0]["title"], "First");
+
+        let unknown = parse_appmsg_metadata(
+            "<msg><appmsg><title>mystery</title><type>40404</type></appmsg></msg>",
+        );
+        assert_eq!(unknown.app.as_ref().unwrap()["kind"], "unknown:40404");
+        assert!(unknown.raw.raw_hash.is_some());
+        assert_eq!(unknown.raw.summary.as_deref(), Some("mystery"));
     }
 }

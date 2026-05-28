@@ -5,15 +5,16 @@ use plist::Value;
 use rusqlite::{params, Connection, OpenFlags, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, to_vec};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::io::{Cursor, Error, ErrorKind, Write};
 use std::iter::IntoIterator;
 use std::str::{from_utf8, Utf8Error};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use tempfile::NamedTempFile;
 
 const DOMAIN: &str = "AppDomain-com.tencent.xin";
+const RECORD_LINE_CHUNK_SIZE: usize = 1024;
 
 mod account;
 mod appmsg;
@@ -27,26 +28,67 @@ mod mmap;
 mod session;
 mod system;
 mod transform;
+mod wxgf;
 mod xml;
 
 #[cfg(test)]
 use account::*;
-#[cfg(test)]
-use appmsg::*;
 use backup::*;
-#[cfg(test)]
-use basic::*;
 #[cfg(test)]
 use contact::*;
 #[cfg(test)]
-use media::*;
-#[cfg(test)]
 use message::*;
 use metadata::*;
-#[cfg(test)]
-use system::*;
+
+struct ChatParseJob<'a> {
+    index: usize,
+    user_db: &'a account::UserDB,
+    backup: &'a Backup,
+    selection: account::ChatSelection,
+}
+
+struct RecordLineChunk<'a> {
+    chat_index: usize,
+    chunk_index: usize,
+    user_db: &'a account::UserDB,
+    backup: &'a Backup,
+    contact: contact::Contact,
+    lines: Vec<message::RecordLine>,
+}
+
+#[derive(Default)]
+struct ChunkQueue<'a> {
+    chunks: std::collections::VecDeque<RecordLineChunk<'a>>,
+    active_readers: usize,
+}
+
+enum RecordChunkEvent {
+    Chunk {
+        chat_index: usize,
+        chunk_index: usize,
+        records: Vec<RecordType>,
+    },
+    ChatDone {
+        chat_index: usize,
+        chunks: usize,
+    },
+}
 
 struct IosWcMetadataMerger;
+
+struct IosWcCollectSink {
+    records: Arc<Mutex<Vec<RecordType>>>,
+}
+
+impl RecordSink for IosWcCollectSink {
+    fn push(&self, record: RecordType) -> Result<()> {
+        self.records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ios wc collect sink poisoned"))?
+            .push(record);
+        Ok(())
+    }
+}
 
 #[async_trait::async_trait]
 impl MetadataMerger for IosWcMetadataMerger {
@@ -54,6 +96,7 @@ impl MetadataMerger for IosWcMetadataMerger {
         &self,
         store: &ChatStore,
         attaches: &Attachments,
+        context: &MetadataMergeContext,
         old: Vec<u8>,
         new: Vec<u8>,
     ) -> Option<Vec<u8>> {
@@ -65,7 +108,7 @@ impl MetadataMerger for IosWcMetadataMerger {
                     .map(|new| (old, new))
             })
         {
-            to_vec(&new.merge(store, attaches, old).await)
+            to_vec(&new.merge(store, attaches, context, old).await)
                 .map_err(|e| error!("Failed to serialize metadata: {}", e))
                 .ok()
         } else {
@@ -88,58 +131,212 @@ impl MsgMatcher for Matcher {
     }
 
     fn get_record_batches(&self, progress: &PipelineProgress) -> Result<Vec<RecordBatch>> {
+        let records = Arc::new(Mutex::new(Vec::<RecordType>::new()));
+        self.stream_records(
+            progress,
+            &IosWcCollectSink {
+                records: Arc::clone(&records),
+            },
+        )?;
+        let records = Arc::try_unwrap(records)
+            .map_err(|_| anyhow::anyhow!("ios wc collect sink still shared"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("ios wc collect sink poisoned"))?;
+        Ok(vec![RecordBatch { records }])
+    }
+
+    fn stream_records(&self, progress: &PipelineProgress, sink: &dyn RecordSink) -> Result<()> {
         let jobs = self
             .extract_ids
             .iter()
             .filter_map(|u| self.extractor.get_user_db(u))
             .flat_map(|(user_db, backup)| {
                 user_db
-                    .get_record_names(self.names.clone())
+                    .get_record_chats(self.names.clone())
                     .into_iter()
-                    .map(move |name| (user_db, backup, name))
+                    .map(move |selection| (user_db, backup, selection))
+            })
+            .enumerate()
+            .map(|(index, (user_db, backup, selection))| ChatParseJob {
+                index,
+                user_db,
+                backup,
+                selection,
             })
             .collect::<Vec<_>>();
         progress.chat_planned(jobs.len() as u64);
         if jobs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let worker_count = std::thread::available_parallelism()
+        let parallelism = std::thread::available_parallelism()
             .map(usize::from)
-            .unwrap_or(4)
-            .min(jobs.len());
-        let jobs = Arc::new(std::sync::Mutex::new(
+            .unwrap_or(4);
+        let reader_count = jobs.len().min(parallelism.clamp(1, 4));
+        let worker_count = parallelism;
+        let jobs = Arc::new(Mutex::new(
             jobs.into_iter().collect::<std::collections::VecDeque<_>>(),
         ));
-        let results = Arc::new(std::sync::Mutex::new(Vec::<RecordBatch>::new()));
+        let queue = Arc::new((
+            Mutex::new(ChunkQueue {
+                active_readers: reader_count,
+                ..Default::default()
+            }),
+            Condvar::new(),
+        ));
+        let (result_tx, result_rx) =
+            std::sync::mpsc::sync_channel::<RecordChunkEvent>(worker_count * 2);
+        let errors = Arc::new(Mutex::new(Vec::<anyhow::Error>::new()));
         std::thread::scope(|scope| {
-            for _ in 0..worker_count {
+            for _ in 0..reader_count {
                 let jobs = Arc::clone(&jobs);
-                let results = Arc::clone(&results);
-                scope.spawn(move || loop {
-                    let Some((user_db, backup, name)) =
-                        jobs.lock().expect("ios wc job queue poisoned").pop_front()
-                    else {
-                        break;
-                    };
-                    let records = user_db.get_records(backup, name.clone());
-                    progress.chat_parsed(records.len() as u64, record_blob_count(&records) as u64);
-                    results
-                        .lock()
-                        .expect("ios wc result queue poisoned")
-                        .push(RecordBatch {
-                            label: format!("{}:{}", user_db.account, name),
-                            records,
+                let queue = Arc::clone(&queue);
+                let result_tx = result_tx.clone();
+                scope.spawn(move || {
+                    loop {
+                        let Some(job) = jobs.lock().expect("ios wc job queue poisoned").pop_front()
+                        else {
+                            break;
+                        };
+                        info!(
+                            "Extracting: {} => {}",
+                            job.selection.selector, job.selection.chat_id
+                        );
+                        let mut chunks = 0_usize;
+                        if let Err(error) = job.user_db.load_record_line_chunks(
+                            &job.selection.chat_id,
+                            RECORD_LINE_CHUNK_SIZE,
+                            |chunk_index, lines| {
+                                chunks += 1;
+                                let chunk = RecordLineChunk {
+                                    chat_index: job.index,
+                                    chunk_index,
+                                    user_db: job.user_db,
+                                    backup: job.backup,
+                                    contact: job.selection.contact.clone(),
+                                    lines,
+                                };
+                                let (queue, available) = &*queue;
+                                queue
+                                    .lock()
+                                    .expect("ios wc chunk queue poisoned")
+                                    .chunks
+                                    .push_back(chunk);
+                                progress.chat_chunk_planned();
+                                available.notify_one();
+                            },
+                        ) {
+                            warn!("failed to get chat line: {}", error);
+                        }
+                        let _ = result_tx.send(RecordChunkEvent::ChatDone {
+                            chat_index: job.index,
+                            chunks,
                         });
+                        progress.chat_parsed(0, 0);
+                    }
+                    let (queue, available) = &*queue;
+                    let mut queue = queue.lock().expect("ios wc chunk queue poisoned");
+                    queue.active_readers -= 1;
+                    available.notify_all();
                 });
             }
+            for _ in 0..worker_count {
+                let queue = Arc::clone(&queue);
+                let result_tx = result_tx.clone();
+                scope.spawn(move || loop {
+                    let chunk = {
+                        let (queue, available) = &*queue;
+                        let mut queue = queue.lock().expect("ios wc chunk queue poisoned");
+                        loop {
+                            if let Some(chunk) = queue.chunks.pop_front() {
+                                break Some(chunk);
+                            }
+                            if queue.active_readers == 0 {
+                                break None;
+                            }
+                            queue = available.wait(queue).expect("ios wc chunk queue poisoned");
+                        }
+                    };
+                    let Some(chunk) = chunk else {
+                        break;
+                    };
+                    let records = chunk.user_db.transform_record_lines(
+                        chunk.backup,
+                        &chunk.contact,
+                        chunk.lines,
+                    );
+                    progress.chat_chunk_parsed(
+                        records.len() as u64,
+                        record_blob_count(&records) as u64,
+                    );
+                    if result_tx
+                        .send(RecordChunkEvent::Chunk {
+                            chat_index: chunk.chat_index,
+                            chunk_index: chunk.chunk_index,
+                            records,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                });
+            }
+            drop(result_tx);
+            let errors = Arc::clone(&errors);
+            scope.spawn(move || {
+                let mut chunks = BTreeMap::<(usize, usize), Vec<RecordType>>::new();
+                let mut chat_chunks = BTreeMap::<usize, usize>::new();
+                let mut expected_chat = 0_usize;
+                let mut expected_chunk = 0_usize;
+                for event in result_rx {
+                    match event {
+                        RecordChunkEvent::Chunk {
+                            chat_index,
+                            chunk_index,
+                            records,
+                        } => {
+                            chunks.insert((chat_index, chunk_index), records);
+                        }
+                        RecordChunkEvent::ChatDone { chat_index, chunks } => {
+                            chat_chunks.insert(chat_index, chunks);
+                        }
+                    }
+                    loop {
+                        if let Some(records) = chunks.remove(&(expected_chat, expected_chunk)) {
+                            for record in records {
+                                if let Err(error) = sink.push(record) {
+                                    errors
+                                        .lock()
+                                        .expect("ios wc error queue poisoned")
+                                        .push(error);
+                                    return;
+                                }
+                            }
+                            expected_chunk += 1;
+                            continue;
+                        }
+                        if chat_chunks
+                            .get(&expected_chat)
+                            .is_some_and(|chunks| *chunks == expected_chunk)
+                        {
+                            chat_chunks.remove(&expected_chat);
+                            expected_chat += 1;
+                            expected_chunk = 0;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            });
         });
-        let mut results = Arc::try_unwrap(results)
-            .map_err(|_| anyhow::anyhow!("ios wc result queue still shared"))?
+        let mut errors = Arc::try_unwrap(errors)
+            .map_err(|_| anyhow::anyhow!("ios wc error queue still shared"))?
             .into_inner()
-            .map_err(|_| anyhow::anyhow!("ios wc result queue poisoned"))?;
-        results.sort_by(|left, right| left.label.cmp(&right.label));
-        Ok(results)
+            .map_err(|_| anyhow::anyhow!("ios wc error queue poisoned"))?;
+        if let Some(error) = errors.pop() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn get_metadata_merger(&self) -> Option<Box<dyn MetadataMerger>> {
@@ -363,6 +560,7 @@ mod tests {
             let friend_chat = format!("Chat_{}", gen_md5("friend"));
             let room_chat = format!("Chat_{}", gen_md5("room@chatroom"));
             let openim_chat = format!("Chat_{}", gen_md5("openim"));
+            let friend_ext = format!("ChatExt2_{}", gen_md5("friend"));
             let rows = [
             (1, 101, 1_598_219_157, "hello", 1, 0, 1, 0),
             (
@@ -379,7 +577,7 @@ mod tests {
                 3,
                 103,
                 1_598_219_159,
-                r#"<msg><videomsg cdnvideourl="video" aeskey="key"/></msg>"#,
+                r#"<msg><videomsg cdnvideourl="video" cdnrawvideourl="raw-video" aeskey="key" cdnrawvideoaeskey="raw-key" md5="video-md5" rawmd5="raw-md5" rawlength="42"/></msg>"#,
                 1,
                 0,
                 43,
@@ -416,6 +614,36 @@ mod tests {
                 10002,
                 0,
             ),
+            (
+                11,
+                111,
+                1_598_219_167,
+                r#"<msg username="openim-contact@kefu.openim" nickname="OpenIM Support" openimdesc="OpenIM Service" smallheadimgurl="https://example.test/openim.png" />"#,
+                1,
+                0,
+                67,
+                0,
+            ),
+            (
+                12,
+                112,
+                1_598_219_168,
+                r#"<msg><img cdnthumburl="thumb-v2" cdnmidimgurl="mid-v2" cdnbigimgurl="hd-v2" aeskey="key-v2"/></msg>"#,
+                1,
+                0,
+                3,
+                0,
+            ),
+            (
+                13,
+                113,
+                1_598_219_169,
+                r#"<msg><videomsg cdnvideourl="temp-video" aeskey="temp-key"/></msg>"#,
+                1,
+                0,
+                43,
+                0,
+            ),
         ];
             for row in rows {
                 conn.execute(
@@ -427,6 +655,27 @@ mod tests {
                 )
                 .unwrap();
             }
+            conn.execute(
+                &format!(
+                    "CREATE TABLE {} (
+                        MesLocalID INTEGER NOT NULL,
+                        MsgSource TEXT,
+                        WCDB_CT_MsgSource INTEGER
+                    )",
+                    friend_ext
+                ),
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                &format!("INSERT INTO {} VALUES (?1, ?2, ?3)", friend_ext),
+                (
+                    1,
+                    "<msgsource><sequence_id>seq-1</sequence_id><strid>str-1</strid><silence>1</silence><membercount>2</membercount><signature>sig-1</signature></msgsource>",
+                    0,
+                ),
+            )
+            .unwrap();
             conn.execute(
                 &format!(
                     "INSERT INTO {} VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -460,6 +709,46 @@ mod tests {
                 (9, 109, 1_598_219_165, "openim hello", 1, 0, 1, 0),
             )
             .unwrap();
+        })
+    }
+
+    fn chunked_message_db(rows: usize) -> Vec<u8> {
+        sqlite_bytes("message_0.sqlite", |conn| {
+            let chat = gen_md5("friend");
+            conn.execute(
+                &format!(
+                    "CREATE TABLE Chat_{} (
+                        MesLocalID INTEGER NOT NULL,
+                        MesSvrID INTEGER NOT NULL,
+                        CreateTime INTEGER NOT NULL,
+                        Message TEXT NOT NULL,
+                        Status INTEGER NOT NULL,
+                        ImgStatus INTEGER NOT NULL,
+                        Type INTEGER NOT NULL,
+                        Des INTEGER NOT NULL
+                    )",
+                    chat
+                ),
+                [],
+            )
+            .unwrap();
+            for index in 0..rows {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO Chat_{} (
+                            MesLocalID, MesSvrID, CreateTime, Message, Status, ImgStatus, Type, Des
+                        ) VALUES (?1, ?2, ?3, ?4, 0, 0, 1, 0)",
+                        chat
+                    ),
+                    params![
+                        index as i64 + 1,
+                        index as i64 + 10_000,
+                        1_598_219_157 + index as i64,
+                        format!("line-{index:04}")
+                    ],
+                )
+                .unwrap();
+            }
         })
     }
 
@@ -691,12 +980,24 @@ mod tests {
                 png(13),
             ),
             (
+                format!("Documents/{}/ImgV2/{}/12.pic_hd", account, friend_hash),
+                png(15),
+            ),
+            (
                 format!("Documents/{}/Video/{}/3.mp4", account, friend_hash),
                 b"video-bytes".to_vec(),
             ),
             (
+                format!("Documents/{}/Video/{}/3_raw.mp4", account, friend_hash),
+                b"raw-video-bytes".to_vec(),
+            ),
+            (
                 format!("Documents/{}/Video/{}/3.video_thum", account, friend_hash),
                 png(14),
+            ),
+            (
+                format!("Documents/{}/Video/{}/13_temp.mp4", account, friend_hash),
+                b"temp-video-bytes".to_vec(),
             ),
             (
                 format!("Documents/{}/Audio/{}/4.aud", account, friend_hash),
@@ -714,10 +1015,26 @@ mod tests {
         let matcher = Matcher::from_backup(backup, None).unwrap();
         let records = matcher.collect_records().unwrap();
 
-        assert_eq!(records.len(), 10);
-        assert!(records
+        assert_eq!(records.len(), 13);
+        let hello = records
             .iter()
-            .any(|record| record.get_record().content == "hello"));
+            .find(|record| record.get_record().content == "hello")
+            .unwrap();
+        let hello_metadata: IosWcMetadata =
+            from_slice(hello.get_record().metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(hello_metadata.msg_type, MsgType::Normal);
+        assert_eq!(
+            hello_metadata.field("msgsource_sequence_id"),
+            Some(&MetadataValue::Str("seq-1".into()))
+        );
+        assert_eq!(
+            hello_metadata.field("msgsource_strid"),
+            Some(&MetadataValue::Str("str-1".into()))
+        );
+        assert_eq!(
+            hello_metadata.field("msgsource_silence"),
+            Some(&MetadataValue::Str("1".into()))
+        );
         assert!(records.iter().any(|record| {
             let record = record.get_record();
             record.group_id == "openim" && record.content == "openim hello"
@@ -739,8 +1056,33 @@ mod tests {
             record.get_record().content == "[img]" && record.attachment_count() == 3
         }));
         assert!(records.iter().any(|record| {
-            record.get_record().content == "[video]" && record.attachment_count() == 2
+            record.get_record().source_message_id.as_deref() == Some("svr:friend:112")
+                && record.get_record().content == "[img]"
+                && record.attachment_count() == 1
         }));
+        assert!(records.iter().any(|record| {
+            record.get_record().content == "[video]" && record.attachment_count() == 3
+        }));
+        assert!(records.iter().any(|record| {
+            record.get_record().content == "[video]" && record.attachment_count() == 1
+        }));
+        let video = records
+            .iter()
+            .find(|record| {
+                record.get_record().content == "[video]" && record.attachment_count() == 3
+            })
+            .unwrap();
+        let video_metadata: IosWcMetadata =
+            from_slice(video.get_record().metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            video_metadata.field("raw_cdn"),
+            Some(&MetadataValue::Str("raw-video".into()))
+        );
+        assert_eq!(
+            video_metadata.field("raw_md5"),
+            Some(&MetadataValue::Str("raw-md5".into()))
+        );
+        assert!(video_metadata.media_hash("video_raw").is_some());
         assert!(records.iter().any(|record| {
             record.get_record().content == "[voice]" && record.attachment_count() == 1
         }));
@@ -753,16 +1095,16 @@ mod tests {
             from_slice(app.get_record().metadata.as_ref().unwrap()).unwrap();
         assert_eq!(app_metadata.msg_type, MsgType::CustomApp);
         assert_eq!(
-            app_metadata.field("title"),
-            Some(&MetadataValue::Str("Doc".into()))
+            app_metadata.app.as_ref().unwrap()["title"],
+            serde_json::json!("Doc")
         );
         assert_eq!(
-            app_metadata.field("description"),
-            Some(&MetadataValue::Str("Desc".into()))
+            app_metadata.app.as_ref().unwrap()["description"],
+            serde_json::json!("Desc")
         );
         assert_eq!(
-            app_metadata.field("url"),
-            Some(&MetadataValue::Str("https://example.test".into()))
+            app_metadata.app.as_ref().unwrap()["url"],
+            serde_json::json!("https://example.test")
         );
         let system = records
             .iter()
@@ -772,12 +1114,12 @@ mod tests {
             from_slice(system.get_record().metadata.as_ref().unwrap()).unwrap();
         assert_eq!(system_metadata.msg_type, MsgType::System);
         assert_eq!(
-            system_metadata.field("system_type"),
-            Some(&MetadataValue::Str("plain".into()))
+            system_metadata.system.as_ref().unwrap()["system_type"],
+            serde_json::json!("plain")
         );
         assert_eq!(
-            system_metadata.field("content"),
-            Some(&MetadataValue::Str("system text".into()))
+            system_metadata.system.as_ref().unwrap()["content"],
+            serde_json::json!("system text")
         );
         let revoke = records
             .iter()
@@ -790,6 +1132,28 @@ mod tests {
             revoke_metadata.field("revoke"),
             Some(&MetadataValue::Str("recalled".into()))
         );
+        let openim_contact = records
+            .iter()
+            .find(|record| {
+                let record = record.get_record();
+                record.content == "[contact]"
+                    && record
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| from_slice::<IosWcMetadata>(metadata).ok())
+                        .is_some_and(|metadata| metadata.msg_type == MsgType::OpenIMContactShare)
+            })
+            .unwrap();
+        let openim_metadata: IosWcMetadata =
+            from_slice(openim_contact.get_record().metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            openim_metadata.field("username"),
+            Some(&MetadataValue::Str("openim-contact@kefu.openim".into()))
+        );
+        assert_eq!(
+            openim_metadata.field("openimdesc"),
+            Some(&MetadataValue::Str("OpenIM Service".into()))
+        );
         assert!(records.iter().any(|record| {
             record
                 .get_record()
@@ -797,6 +1161,89 @@ mod tests {
                 .as_deref()
                 .is_some_and(|id| id == "svr:friend:101")
         }));
+    }
+
+    #[test]
+    fn ios_wechat_chunked_chat_import_keeps_record_order() {
+        let dir = tempdir().unwrap();
+        write_minimal_backup_metadata(dir.path());
+        let account = "account-a";
+        write_manifest_db(
+            dir.path(),
+            vec![
+                (
+                    "Documents/account-a/WCDB_Contact.sqlite".into(),
+                    fixture_contact_db(),
+                ),
+                (
+                    "Documents/account-a/message_0.sqlite".into(),
+                    chunked_message_db(RECORD_LINE_CHUNK_SIZE + 3),
+                ),
+                (
+                    format!("Documents/{}/mmsetting.archive", account),
+                    settings_bytes("owner-wxid", "Owner"),
+                ),
+            ],
+        );
+
+        let mut backup = Backup::new(dir.path()).unwrap();
+        backup.parse_manifest().unwrap();
+        let matcher = Matcher::from_backup(backup, None).unwrap();
+        let records = matcher.collect_records().unwrap();
+
+        assert_eq!(records.len(), RECORD_LINE_CHUNK_SIZE + 3);
+        assert_eq!(records[0].get_record().content, "line-0000");
+        assert_eq!(
+            records[RECORD_LINE_CHUNK_SIZE].get_record().content,
+            "line-1024"
+        );
+        assert_eq!(records.last().unwrap().get_record().content, "line-1026");
+    }
+
+    #[test]
+    fn ios_wechat_uses_mmappedkv_setting_for_db_folder_account() {
+        let dir = tempdir().unwrap();
+        write_minimal_backup_metadata(dir.path());
+        let wxid = "owner-wxid";
+        let account = gen_md5(wxid);
+        write_manifest_db(
+            dir.path(),
+            vec![
+                (
+                    format!("Documents/{}/DB/WCDB_Contact.sqlite", account),
+                    fixture_contact_db(),
+                ),
+                (
+                    format!("Documents/{}/DB/message_0.sqlite", account),
+                    fixture_message_db(),
+                ),
+                (
+                    format!("Documents/MMappedKV/mmsetting.archive.{}", wxid),
+                    Vec::new(),
+                ),
+                (
+                    format!("Documents/MMappedKV/mmsetting.archive.{}.crc", wxid),
+                    b"crc".to_vec(),
+                ),
+            ],
+        );
+
+        let mut backup = Backup::new(dir.path()).unwrap();
+        backup.parse_manifest().unwrap();
+        let extractor = Extractor::from_backup(backup).unwrap();
+        let users = extractor.get_users();
+        assert_eq!(users, vec![account.clone()]);
+        let (user_db, _) = extractor.get_user_db(&account).unwrap();
+        assert_eq!(user_db.wxid, wxid);
+        assert_eq!(
+            user_db
+                .kv_setting
+                .as_ref()
+                .unwrap()
+                .relative_filename
+                .as_str(),
+            "Documents/MMappedKV/mmsetting.archive.owner-wxid"
+        );
     }
 
     #[test]
@@ -972,21 +1419,6 @@ mod tests {
         plist::to_file_xml(dir.join("Manifest.plist"), &Value::Dictionary(manifest)).unwrap();
     }
 
-    #[test]
-    fn ios_wechat_second_create_time_is_converted_to_millis() {
-        let timestamp = UserDB::create_time_timestamp_millis(1_598_219_157, 42);
-
-        assert!((1_598_219_157_000..1_598_219_158_000).contains(&timestamp));
-    }
-
-    #[test]
-    fn ios_wechat_millisecond_create_time_is_not_multiplied_again() {
-        assert_eq!(
-            UserDB::create_time_timestamp_millis(1_598_219_157_438, 42),
-            1_598_219_157_438
-        );
-    }
-
     #[tokio::test]
     async fn ios_wechat_same_sender_second_collision_uses_source_message_id() {
         let backup_dir = tempdir().unwrap();
@@ -1021,6 +1453,7 @@ mod tests {
                     image_status: 0,
                     msg_type: MsgType::Normal,
                     is_dest: false,
+                    msg_source: None,
                 },
                 &contact,
             )
@@ -1037,6 +1470,7 @@ mod tests {
                     image_status: 0,
                     msg_type: MsgType::Normal,
                     is_dest: false,
+                    msg_source: None,
                 },
                 &contact,
             )
@@ -1089,6 +1523,7 @@ mod tests {
                     image_status: 0,
                     msg_type: MsgType::Normal,
                     is_dest: false,
+                    msg_source: None,
                 },
                 &contact,
             )
@@ -1105,6 +1540,7 @@ mod tests {
                     image_status: 0,
                     msg_type: MsgType::Normal,
                     is_dest: false,
+                    msg_source: None,
                 },
                 &contact,
             )
@@ -1129,312 +1565,6 @@ mod tests {
         let stored = store.query(crate::store::Query::default()).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].content, "updated");
-    }
-
-    #[test]
-    fn ios_wechat_source_message_id_fallback_includes_local_facts() {
-        let contact = Contact {
-            name: "chat-a".into(),
-            ..Default::default()
-        };
-        let line = RecordLine {
-            local_id: 7,
-            server_id: 0,
-            created_time: 1_598_219_157,
-            message: "fallback".into(),
-            status: 0,
-            image_status: 0,
-            msg_type: MsgType::Normal,
-            is_dest: false,
-        };
-        let first = UserDB::source_message_id(&contact, &line, "fallback", &HashMap::new());
-        let second = UserDB::source_message_id(&contact, &line, "changed", &HashMap::new());
-        let with_attachment = UserDB::source_message_id(
-            &contact,
-            &line,
-            "fallback",
-            &[("asset".into(), b"bytes".to_vec())]
-                .iter()
-                .cloned()
-                .collect(),
-        );
-
-        assert!(first.starts_with("fallback:chat-a:1598219157:7:"));
-        assert_ne!(first, second);
-        assert_ne!(first, with_attachment);
-    }
-
-    #[test]
-    fn ios_wechat_typed_metadata_serializes_media_roles() {
-        let metadata = IosWcMetadata::new()
-            .with_type(MsgType::Image)
-            .with_hash("mid".into(), "hash-img".into())
-            .with_hash("thumb".into(), "hash-thum".into())
-            .with_tag("cdn".into(), "https://cdn.test/image".into());
-
-        let encoded = to_vec(&metadata).unwrap();
-        let decoded: IosWcMetadata = from_slice(&encoded).unwrap();
-
-        assert_eq!(decoded.msg_type, MsgType::Image);
-        assert_eq!(decoded.media_hash("mid"), Some("hash-img"));
-        assert_eq!(decoded.media_hash("thumb"), Some("hash-thum"));
-        assert_eq!(
-            decoded.field("cdn"),
-            Some(&MetadataValue::Str("https://cdn.test/image".into()))
-        );
-    }
-
-    #[test]
-    fn ios_wechat_invalid_media_xml_records_parse_error() {
-        let image_metadata = RecordLine {
-            local_id: 1,
-            server_id: 1,
-            created_time: 1,
-            message: "<!DOCTYPE msg><msg><img /></msg>".into(),
-            status: 0,
-            image_status: 0,
-            msg_type: MsgType::Image,
-            is_dest: false,
-        };
-        let image_metadata =
-            MediaResolver::image_metadata(&image_metadata).with_type(MsgType::Image);
-        let voice_metadata = RecordLine {
-            local_id: 2,
-            server_id: 2,
-            created_time: 2,
-            message: "<!DOCTYPE msg><msg><voicemsg /></msg>".into(),
-            status: 0,
-            image_status: 0,
-            msg_type: MsgType::Voice,
-            is_dest: false,
-        };
-        let voice_metadata =
-            MediaResolver::audio_metadata(&voice_metadata).with_type(MsgType::Voice);
-
-        assert_eq!(image_metadata.msg_type, MsgType::Image);
-        assert_eq!(
-            image_metadata.raw.parse_error.as_deref(),
-            Some("invalid image xml")
-        );
-        assert_eq!(voice_metadata.msg_type, MsgType::Voice);
-        assert_eq!(
-            voice_metadata.raw.parse_error.as_deref(),
-            Some("invalid voice xml")
-        );
-    }
-
-    #[test]
-    fn ios_wechat_invalid_non_media_xml_records_parse_error() {
-        let invalid = "<!DOCTYPE msg><msg />";
-        let contact_line = RecordLine {
-            local_id: 1,
-            server_id: 1,
-            created_time: 1,
-            message: invalid.into(),
-            status: 0,
-            image_status: 0,
-            msg_type: MsgType::ContactShare,
-            is_dest: false,
-        };
-        let contact_metadata = parse_contact_share(&contact_line).with_type(MsgType::ContactShare);
-        let location_line = RecordLine {
-            local_id: 2,
-            server_id: 2,
-            created_time: 2,
-            message: invalid.into(),
-            status: 0,
-            image_status: 0,
-            msg_type: MsgType::Location,
-            is_dest: false,
-        };
-        let location_metadata = parse_location(&location_line).with_type(MsgType::Location);
-        let revoke_line = RecordLine {
-            local_id: 3,
-            server_id: 3,
-            created_time: 3,
-            message: invalid.into(),
-            status: 0,
-            image_status: 0,
-            msg_type: MsgType::Revoke,
-            is_dest: false,
-        };
-        let (_, revoke_metadata) = parse_system_message(&revoke_line.message, MsgType::Revoke);
-
-        assert_eq!(
-            contact_metadata.raw.parse_error.as_deref(),
-            Some("invalid contact xml")
-        );
-        assert_eq!(
-            location_metadata.raw.parse_error.as_deref(),
-            Some("invalid location xml")
-        );
-        assert_eq!(
-            revoke_metadata.raw.parse_error.as_deref(),
-            Some("invalid revoke xml")
-        );
-    }
-
-    #[test]
-    fn ios_wechat_appmsg_subtypes_emit_structured_metadata() {
-        let cases = [
-            (
-                "file",
-                r#"<msg><appmsg><title>report.pdf</title><type>6</type><fileext>pdf</fileext><totallen>42</totallen></appmsg></msg>"#,
-                "[file] report.pdf",
-                "fileext",
-                "pdf",
-            ),
-            (
-                "refer",
-                r#"<msg><appmsg><title>reply</title><type>57</type><refermsg><displayname>Alice</displayname><content>hello</content></refermsg></appmsg></msg>"#,
-                "[refer] reply",
-                "refer_display_name",
-                "Alice",
-            ),
-            (
-                "transfer",
-                r#"<msg><appmsg><title>transfer</title><type>2000</type><wcpayinfo><feedesc>$1.00</feedesc><pay_memo>memo</pay_memo></wcpayinfo></appmsg></msg>"#,
-                "[transfer] transfer",
-                "feedesc",
-                "$1.00",
-            ),
-            (
-                "red_packet",
-                r#"<msg><appmsg><title>packet</title><type>2001</type></appmsg></msg>"#,
-                "[red packet] packet",
-                "title",
-                "packet",
-            ),
-            (
-                "mini_program",
-                r#"<msg><appmsg><title>mini</title><type>33</type><weappinfo><username>gh_x</username></weappinfo></appmsg></msg>"#,
-                "[mini program] mini",
-                "mini_program_username",
-                "gh_x",
-            ),
-        ];
-
-        for (kind, xml, label, field, value) in cases {
-            let metadata = parse_appmsg_metadata(xml).with_type(MsgType::CustomApp);
-            assert_eq!(appmsg_label(&metadata), label);
-            assert_eq!(metadata.app.as_ref().unwrap()["kind"], kind);
-            assert_eq!(
-                metadata.field(field),
-                Some(&MetadataValue::Str(value.into()))
-            );
-        }
-    }
-
-    #[test]
-    fn ios_wechat_appmsg_declared_subtypes_are_not_unknown() {
-        let cases = [
-            (1, "text", "[appmsg] item"),
-            (2, "image", "[appmsg] item"),
-            (3, "audio", "[appmsg] item"),
-            (4, "video", "[appmsg] item"),
-            (7, "text", "[appmsg] item"),
-            (8, "video", "[appmsg] item"),
-            (17, "realtime_location", "[realtime location] item"),
-            (24, "note", "[note] item"),
-            (50, "channels", "[channels] item"),
-            (51, "channels", "[channels] item"),
-            (62, "pat", "[pat] item"),
-            (100001, "reader", "[reader] item"),
-        ];
-
-        for (appmsg_type, kind, label) in cases {
-            let metadata = parse_appmsg_metadata(&format!(
-                "<msg><appmsg><title>item</title><type>{}</type></appmsg></msg>",
-                appmsg_type
-            ));
-            assert_eq!(metadata.app.as_ref().unwrap()["kind"], kind);
-            assert_eq!(appmsg_label(&metadata), label);
-            assert!(metadata.raw.raw_hash.is_none());
-        }
-    }
-
-    #[test]
-    fn ios_wechat_forwarded_and_unknown_appmsg_metadata() {
-        let forwarded_xml = r#"<record><dataitem><datatitle>First</datatitle><sourcename>Alice</sourcename><datadesc>Hello</datadesc></dataitem></record>"#;
-        let metadata = parse_appmsg_metadata(&format!(
-            "<msg><appmsg><title>history</title><type>19</type><recorditem>{}</recorditem></appmsg></msg>",
-            htmlescape::encode_minimal(forwarded_xml)
-        ));
-        let forwarded = metadata.app.as_ref().unwrap()["forwarded"]
-            .as_array()
-            .unwrap();
-        assert_eq!(appmsg_label(&metadata), "[forwarded] history");
-        assert_eq!(forwarded.len(), 1);
-        assert_eq!(forwarded[0]["title"], "First");
-
-        let unknown = parse_appmsg_metadata(
-            "<msg><appmsg><title>mystery</title><type>40404</type></appmsg></msg>",
-        );
-        assert_eq!(unknown.app.as_ref().unwrap()["kind"], "unknown:40404");
-        assert!(unknown.raw.raw_hash.is_some());
-        assert_eq!(unknown.raw.summary.as_deref(), Some("mystery"));
-    }
-
-    #[test]
-    fn ios_wechat_system_success_classifications_have_metadata() {
-        let cases = [
-        (
-            "<sysmsg><sysmsgtemplate><content_template><template>invited</template></content_template></sysmsgtemplate></sysmsg>",
-            "sysmsgtemplate",
-            "invited",
-        ),
-        (
-            "<sysmsg><editrevokecontent>edited</editrevokecontent></sysmsg>",
-            "editrevokecontent",
-            "edited",
-        ),
-        (
-            "<sysmsg type=\"paymsg\"><paymsg><template>paid</template></paymsg></sysmsg>",
-            "paymsg",
-            "paid",
-        ),
-        ("Alice 邀请 Bob 加入了群聊", "room_join", "Alice 邀请 Bob 加入了群聊"),
-        ("Alice 退出了群聊", "room_leave", "Alice 退出了群聊"),
-        ("Alice 修改群名为 Project", "room_rename", "Alice 修改群名为 Project"),
-        ("群公告 updated", "room_announcement", "群公告 updated"),
-        ("Alice 拍了拍 Bob", "pat", "Alice 拍了拍 Bob"),
-        ("Alice 领取了红包", "red_packet", "Alice 领取了红包"),
-    ];
-
-        for (message, system_type, content) in cases {
-            let (label, metadata) = parse_system_message(message, MsgType::System);
-            assert_eq!(label, format!("[system:{}]", system_type));
-            assert_eq!(
-                metadata.field("system_type"),
-                Some(&MetadataValue::Str(system_type.into()))
-            );
-            assert_eq!(
-                metadata.field("content"),
-                Some(&MetadataValue::Str(content.into()))
-            );
-            assert_eq!(
-                metadata.system.as_ref().unwrap()["system_type"],
-                system_type
-            );
-        }
-    }
-
-    #[test]
-    fn ios_wechat_system_parser_fallback_preserves_text() {
-        let (label, metadata) =
-            parse_system_message("<sysmsg><paymsg><template>paid</template>", MsgType::System);
-
-        assert_eq!(label, "[system:plain]");
-        assert_eq!(
-            metadata.raw.parse_error.as_deref(),
-            Some("invalid system xml")
-        );
-        assert_eq!(
-            metadata.field("content"),
-            Some(&MetadataValue::Str(
-                "<sysmsg><paymsg><template>paid</template>".into()
-            ))
-        );
     }
 
     #[test]
@@ -1467,6 +1597,7 @@ mod tests {
                     image_status: 0,
                     msg_type: MsgType::CustomApp,
                     is_dest: true,
+                    msg_source: None,
                 },
                 &contact,
             )
@@ -1509,6 +1640,7 @@ mod tests {
                     image_status: 2,
                     msg_type: MsgType::Image,
                     is_dest: true,
+                    msg_source: None,
                 },
                 &contact,
             )
@@ -1557,6 +1689,7 @@ mod tests {
                     image_status: 0,
                     msg_type: MsgType::Location,
                     is_dest: true,
+                    msg_source: None,
                 },
                 &contact,
             )
@@ -1602,10 +1735,7 @@ mod tests {
         };
         store
             .insert_or_update(
-                RecordType::from((
-                    record,
-                    [(old_img_hash.clone(), old_img)].iter().cloned().collect(),
-                )),
+                RecordType::from((record, attachments([(old_img_hash.clone(), old_img)]))),
                 None,
             )
             .await
@@ -1615,10 +1745,8 @@ mod tests {
         let merged = merger
             .merge(
                 &store,
-                &[(new_thum_hash.clone(), new_thum)]
-                    .iter()
-                    .cloned()
-                    .collect(),
+                &attachments([(new_thum_hash.clone(), new_thum)]),
+                &MetadataMergeContext::default(),
                 to_vec(&old_metadata).unwrap(),
                 to_vec(&new_metadata).unwrap(),
             )
@@ -1646,7 +1774,6 @@ mod tests {
                 record_blob_count(&self.records) as u64,
             );
             Ok(vec![RecordBatch {
-                label: "test".into(),
                 records: self.records.clone(),
             }])
         }
@@ -1695,13 +1822,10 @@ mod tests {
             &TestMatcher {
                 records: vec![RecordType::from((
                     old_record,
-                    [
+                    attachments([
                         (old_img_hash.clone(), old_img),
                         (old_thum_hash.clone(), old_thum),
-                    ]
-                    .iter()
-                    .cloned()
-                    .collect(),
+                    ]),
                 ))],
             },
         )
@@ -1725,10 +1849,7 @@ mod tests {
             &TestMatcher {
                 records: vec![RecordType::from((
                     new_record,
-                    [(new_thum_hash.clone(), new_thum.clone())]
-                        .iter()
-                        .cloned()
-                        .collect(),
+                    attachments([(new_thum_hash.clone(), new_thum.clone())]),
                 ))],
             },
         )
@@ -1747,5 +1868,12 @@ mod tests {
                 .unwrap(),
             Some(new_thum)
         );
+    }
+
+    fn attachments<const N: usize>(items: [(String, Vec<u8>); N]) -> Attachments {
+        Vec::from(items)
+            .into_iter()
+            .map(|(name, bytes)| (name, Attachment::from_bytes(bytes)))
+            .collect()
     }
 }
